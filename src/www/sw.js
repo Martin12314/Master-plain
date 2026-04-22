@@ -1,11 +1,6 @@
-// ============================================================================
-// File: www/sw.js
-// ============================================================================
-
-// sw.js — Service Worker for apex origin
-// Response verification + protected-flow bootstrap + request signing
-
+// www/sw.js
 let SIG_VERIFY_KEY = null;
+let SIG_VERIFY_KID = null;
 
 let REQ_SIGN_KEYPAIR = null;
 let REQ_SIGN_KID = null;
@@ -37,6 +32,21 @@ function log(...args) {
       });
     }
   });
+}
+
+function logJson(title, obj) {
+  log(`${title}\n${JSON.stringify(obj, null, 2)}`);
+}
+
+function normalizeDemo(mode) {
+  return String(mode || '').trim().toLowerCase();
+}
+
+function getDemoForApi(url) {
+  if (url.pathname !== '/api/login' && url.pathname !== '/api/echo') {
+    return '';
+  }
+  return normalizeDemo(url.searchParams.get('demo'));
 }
 
 function shouldBypassSecurity(url) {
@@ -107,53 +117,97 @@ function isProtectedContentType(ct) {
   );
 }
 
-async function verifyResponse(response, bodyBytes, method, targetUri) {
-  if (!SIG_VERIFY_KEY) {
-    throw new Error('verification key not installed');
-  }
+async function computeDigestHeader(bodyBytes) {
+  const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
+  return 'sha-256=:' + bytesToB64(actualHash) + ':';
+}
 
+function buildResponseSignatureBase(response, method, targetUri) {
   const cd = response.headers.get('Content-Digest');
-  const sig = response.headers.get('Signature');
   const sigInput = response.headers.get('Signature-Input');
 
-  if (!cd || !sig || !sigInput) {
-    throw new Error('missing security headers (need Content-Digest + Signature + Signature-Input)');
-  }
-
-  const expectedB64 = parseDigestHeader(cd);
-  if (!expectedB64) {
-    throw new Error('bad Content-Digest format');
-  }
-
-  const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
-  const actualB64 = bytesToB64(actualHash);
-
-  if (actualB64 !== expectedB64) {
-    throw new Error('digest mismatch');
+  if (!cd || !sigInput) {
+    return null;
   }
 
   const params = sigInput.replace(/^sig1=/, '');
-  const base =
+  return (
     `"@method": "${String(method).toLowerCase()}"\n` +
     `"@target-uri": "${targetUri}"\n` +
     `"@status": ${response.status}\n` +
     `content-digest: ${cd}\n` +
-    `"@signature-params": ${params}`;
+    `"@signature-params": ${params}`
+  );
+}
 
-  const sigB64 = parseSigHeader(sig);
+async function buildResponseVerifyLog(response, bodyBytes, method, targetUri) {
+  const contentDigest = response.headers.get('Content-Digest');
+  const signature = response.headers.get('Signature');
+  const signatureInput = response.headers.get('Signature-Input');
+  const computedDigest = await computeDigestHeader(bodyBytes);
+  const signatureBase = buildResponseSignatureBase(response, method, targetUri);
+
+  const info = {
+    method,
+    targetUri,
+    status: response.status,
+    receivedDigest: contentDigest,
+    computedDigest,
+    digestMatches: contentDigest === computedDigest,
+    verificationKeyId: SIG_VERIFY_KID,
+    signatureInput,
+    signature,
+    signatureBase,
+    signatureValid: null
+  };
+
+  if (!contentDigest || !signature || !signatureInput) {
+    info.error = 'missing security headers';
+    return info;
+  }
+
+  const digestB64 = parseDigestHeader(contentDigest);
+  if (!digestB64) {
+    info.error = 'bad Content-Digest format';
+    return info;
+  }
+
+  if (contentDigest !== computedDigest) {
+    info.error = 'digest mismatch';
+    return info;
+  }
+
+  const sigB64 = parseSigHeader(signature);
   if (!sigB64) {
-    throw new Error('bad Signature format');
+    info.error = 'bad Signature format';
+    return info;
   }
 
   const ok = await crypto.subtle.verify(
     { name: 'RSA-PSS', saltLength: 32 },
     SIG_VERIFY_KEY,
     b64ToBytes(sigB64),
-    new TextEncoder().encode(base)
+    new TextEncoder().encode(signatureBase)
   );
 
+  info.signatureValid = ok;
   if (!ok) {
-    throw new Error('signature verification failed');
+    info.error = 'signature verification failed';
+  }
+
+  return info;
+}
+
+async function verifyResponse(response, bodyBytes, method, targetUri) {
+  if (!SIG_VERIFY_KEY) {
+    throw new Error('verification key not installed');
+  }
+
+  const info = await buildResponseVerifyLog(response, bodyBytes, method, targetUri);
+  logJson(info.error ? 'Response verification FAILED' : 'Response verification OK', info);
+
+  if (info.error) {
+    throw new Error(info.error);
   }
 }
 
@@ -216,6 +270,7 @@ async function generateReqSigningKeypair() {
     return {
       kid: REQ_SIGN_KID,
       jwk,
+      privateKey: REQ_SIGN_KEYPAIR.privateKey,
       reused: true
     };
   }
@@ -241,6 +296,34 @@ async function generateReqSigningKeypair() {
   return {
     kid: REQ_SIGN_KID,
     jwk,
+    privateKey: REQ_SIGN_KEYPAIR.privateKey,
+    reused: false
+  };
+}
+
+async function generateEphemeralReqSigningKeypair() {
+  const kid = 'sw-demo-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+
+  const keypair = await crypto.subtle.generateKey(
+    {
+      name: 'RSA-PSS',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256'
+    },
+    true,
+    ['sign', 'verify']
+  );
+
+  const jwk = await crypto.subtle.exportKey('jwk', keypair.publicKey);
+  jwk.alg = 'PS256';
+  jwk.use = 'sig';
+  jwk.kid = kid;
+
+  return {
+    kid,
+    jwk,
+    privateKey: keypair.privateKey,
     reused: false
   };
 }
@@ -269,48 +352,56 @@ async function fetchVerifiedHostJweJwk() {
   await verifyResponse(r, bodyBytes, 'GET', targetUri);
 
   const jwk = JSON.parse(new TextDecoder().decode(bodyBytes));
-  if (!jwk || jwk.kty !== 'RSA' || !jwk.n || !jwk.e) {
+  if (!jwk || !jwk.n || !jwk.e) {
     throw new Error('invalid host JWE key');
   }
 
   HOST_JWE_JWK = jwk;
   HOST_JWE_KID = jwk.kid || '(no-kid)';
-
   log('verified host JWE key fetched (kid=' + HOST_JWE_KID + ')');
 
   return jwk;
 }
 
-async function registerReqSigningKeyWithServer() {
+async function registerReqSigningKeyWithServer(demo = '', ephemeral = false) {
   const hostJwk = HOST_JWE_JWK || await fetchVerifiedHostJweJwk();
-  const result = await generateReqSigningKeypair();
+  const material = ephemeral
+    ? await generateEphemeralReqSigningKeypair()
+    : await generateReqSigningKeypair();
 
-  const thumbprint = await computeReqSignJwkThumbprint(result.jwk);
-  const proofBase = buildReqKeyRegistrationProofBase(result.kid, thumbprint);
+  const thumbprint = await computeReqSignJwkThumbprint(material.jwk);
+  const proofBase = buildReqKeyRegistrationProofBase(material.kid, thumbprint);
 
   const proofBuf = await crypto.subtle.sign(
     { name: 'RSA-PSS', saltLength: 32 },
-    REQ_SIGN_KEYPAIR.privateKey,
+    material.privateKey,
     new TextEncoder().encode(proofBase)
   );
 
-  log('registering request-sign public key with server (kid=' + result.kid + ', thumb=' + thumbprint + ')');
+  const targetUri = demo
+    ? '/req-key/register?demo=' + encodeURIComponent(demo)
+    : '/req-key/register';
 
-  const j = await fetchVerifiedJson('POST', '/req-key/register', {
+  log('registering request-sign public key with server (kid=' + material.kid + ', thumb=' + thumbprint + ')');
+
+  const j = await fetchVerifiedJson('POST', targetUri, {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      kid: result.kid,
-      jwk: result.jwk,
+      kid: material.kid,
+      jwk: material.jwk,
       jwkThumbprint: thumbprint,
       proof: bytesToB64(proofBuf)
     })
   });
 
+  log('[REQ-KEY-REGISTER] client thumbprint = ' + thumbprint);
+  log('[REQ-KEY-REGISTER] host   thumbprint = ' + (j?.acceptedThumbprint || '(missing)'));
+
   if (!j?.ok) {
     throw new Error('request-sign registration not accepted');
   }
 
-  if (j.acceptedKid !== result.kid) {
+  if (j.acceptedKid !== material.kid) {
     throw new Error('request-sign registration kid mismatch');
   }
 
@@ -318,16 +409,18 @@ async function registerReqSigningKeyWithServer() {
     throw new Error('request-sign registration thumbprint mismatch');
   }
 
-  REQ_SIGN_THUMBPRINT = thumbprint;
-  REQ_SIGN_READY = true;
+  if (!ephemeral) {
+    REQ_SIGN_THUMBPRINT = thumbprint;
+    REQ_SIGN_READY = true;
+  }
 
   return {
     ok: true,
-    reqSignKid: result.kid,
+    reqSignKid: material.kid,
     reqSignThumbprint: thumbprint,
     hostJweKid: hostJwk.kid || '(no-kid)',
     hostJweJwk: hostJwk,
-    reused: result.reused
+    reused: material.reused
   };
 }
 
@@ -368,13 +461,7 @@ async function ensureProtectedFlowReady() {
       reused: reg.reused
     };
 
-    log(
-      'protected-flow ready',
-      'hostKid=' + out.hostJweKid,
-      'reqSignKid=' + out.reqSignKid,
-      'thumb=' + out.reqSignThumbprint
-    );
-
+    log('protected-flow ready hostKid=' + out.hostJweKid + ' reqSignKid=' + out.reqSignKid + ' thumb=' + out.reqSignThumbprint);
     return out;
   })();
 
@@ -398,16 +485,17 @@ self.addEventListener('message', async event => {
         ['verify']
       );
 
-      const kid = event.data.jwk?.kid || '?';
-      log('signature verification key installed (kid=' + kid + ')');
+      SIG_VERIFY_KID = event.data.jwk?.kid || '?';
+      log('signature verification key installed (kid=' + SIG_VERIFY_KID + ')');
 
       if (event.source?.postMessage) {
-        event.source.postMessage({ type: 'SIG_KEY_INSTALLED', kid });
+        event.source.postMessage({ type: 'SIG_KEY_INSTALLED', kid: SIG_VERIFY_KID });
       }
     } catch (e) {
       SIG_VERIFY_KEY = null;
+      SIG_VERIFY_KID = null;
       const msg = e?.message || String(e);
-      log('ERROR installing signature key:', msg);
+      log('ERROR installing signature key: ' + msg);
 
       if (event.source?.postMessage) {
         event.source.postMessage({ type: 'SIG_KEY_ERROR', message: msg });
@@ -432,7 +520,7 @@ self.addEventListener('message', async event => {
       }
     } catch (e) {
       const msg = e?.message || String(e);
-      log('ERROR request-sign bootstrap:', msg);
+      log('ERROR request-sign bootstrap: ' + msg);
 
       if (event.source?.postMessage) {
         event.source.postMessage({
@@ -458,7 +546,7 @@ self.addEventListener('message', async event => {
       }
     } catch (e) {
       const msg = e?.message || String(e);
-      log('ERROR protected-flow bootstrap:', msg);
+      log('ERROR protected-flow bootstrap: ' + msg);
 
       if (event.source?.postMessage) {
         event.source.postMessage({
@@ -469,6 +557,32 @@ self.addEventListener('message', async event => {
       }
     }
     return;
+  }
+
+  if (type === 'RUN_HOST_WRONG_CLIENT_KEY_DEMO') {
+    try {
+      await registerReqSigningKeyWithServer('host-wrong-client-key', true);
+      log('Host wrong client key demo unexpectedly passed');
+
+      if (event.source?.postMessage) {
+        event.source.postMessage({
+          type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
+          ok: false,
+          message: 'Unexpected success'
+        });
+      }
+    } catch (e) {
+      const msg = e?.message || String(e);
+      log('Host wrong client key demo result: ' + msg);
+
+      if (event.source?.postMessage) {
+        event.source.postMessage({
+          type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
+          ok: true,
+          message: msg
+        });
+      }
+    }
   }
 });
 
@@ -500,6 +614,10 @@ async function addRequestSignature(headers, method, targetUri, bodyBytes) {
   headers.set('X-Req-Signature', bytesToB64(sigBuf));
 }
 
+function applyRequestDigestTamper(headers) {
+  headers.set('X-Req-Content-Digest', 'sha-256=:' + bytesToB64(new Uint8Array(32)) + ':');
+}
+
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
@@ -508,6 +626,8 @@ self.addEventListener('fetch', event => {
   if (BOOTSTRAP_PATHS.has(url.pathname)) return;
 
   event.respondWith((async () => {
+    const demo = getDemoForApi(url);
+
     if (shouldBypassSecurity(url)) {
       const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
 
@@ -531,13 +651,13 @@ self.addEventListener('fetch', event => {
       }
 
       const res = await fetch(upstreamUrl, init);
-      log('BYPASS', url.pathname, '→', res.status);
+      log('BYPASS ' + url.pathname + ' → ' + res.status);
       return res;
     }
 
     if (!SIG_VERIFY_KEY) {
       const res = await fetch(event.request);
-      log('PASS (no key yet)', url.pathname, '→', res.status);
+      log('PASS (no key yet) ' + url.pathname + ' → ' + res.status);
       return res;
     }
 
@@ -568,19 +688,24 @@ self.addEventListener('fetch', event => {
       await ensureProtectedFlowReady();
       const targetUri = url.pathname + url.search;
       await addRequestSignature(init.headers, event.request.method, targetUri, requestBodyBytes);
+
+      if (demo === 'req-bad-digest') {
+        applyRequestDigestTamper(init.headers);
+        log('request demo active: wrong request digest');
+      }
     }
 
     let res;
     try {
       res = await fetch(upstreamUrl, init);
     } catch (e) {
-      log('NETWORK ERROR', url.pathname, e?.message || String(e));
+      log('NETWORK ERROR ' + url.pathname + ' ' + (e?.message || String(e)));
       throw e;
     }
 
     const ct = res.headers.get('Content-Type') || '';
     if (!isProtectedContentType(ct)) {
-      log('PASS (unverified type)', url.pathname, 'ct=', ct, '→', res.status);
+      log('PASS (unverified type) ' + url.pathname + ' ct=' + ct + ' → ' + res.status);
       return res;
     }
 
@@ -591,8 +716,6 @@ self.addEventListener('fetch', event => {
       const targetUri = url.pathname + url.search;
       await verifyResponse(res, bodyBytes, method, targetUri);
 
-      log('OK', url.pathname, 'ct=', ct, 'status=', res.status);
-
       const outHeaders = new Headers(res.headers);
       outHeaders.delete('content-length');
 
@@ -602,10 +725,10 @@ self.addEventListener('fetch', event => {
         headers: outHeaders
       });
     } catch (e) {
-      log('BLOCK', url.pathname, 'reason=', e.message || String(e), 'ct=', ct, 'status=', res.status);
+      log('BLOCK ' + url.pathname + ' reason=' + (e?.message || String(e)) + ' ct=' + ct + ' status=' + res.status);
 
       return new Response(
-        'Blocked by Service Worker (integrity violation): ' + (e.message || 'unknown'),
+        'Blocked by Service Worker (integrity violation): ' + (e?.message || 'unknown'),
         { status: 498, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
       );
     }

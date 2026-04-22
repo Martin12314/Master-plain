@@ -28,15 +28,6 @@
 <body>
 <h1>Login</h1>
 
-<p style="margin:.5rem 0 1rem 0">
-    Tamper demo:
-    <a href="/login.html">normal</a> ·
-    <a href="/login.html?tamper=signature">signature</a> ·
-    <a href="/login.html?tamper=digest">digest</a> ·
-    <a href="/login.html?tamper=body">body</a> ·
-    <a href="/login.html?tamper=all">all</a>
-</p>
-
 <div class="card">
     <div class="row">
         <label>Username <input id="user" value="alice" autocomplete="username"></label>
@@ -45,6 +36,9 @@
 
     <div class="row" style="margin-top:.5rem">
         <button id="loginBtn" disabled>Sign in</button>
+        <button id="badReqDigestBtn" disabled>Wrong request digest</button>
+        <button id="badRespDigestBtn" disabled>Wrong response digest</button>
+        <button id="wrongHostKeyBtn" disabled>Wrong host key from SW</button>
     </div>
 
     <div class="row">
@@ -66,6 +60,9 @@
     const secLog = document.getElementById('security-log');
     const kxStatus = document.getElementById('kxStatus');
     const loginBtn = document.getElementById('loginBtn');
+    const badReqDigestBtn = document.getElementById('badReqDigestBtn');
+    const badRespDigestBtn = document.getElementById('badRespDigestBtn');
+    const wrongHostKeyBtn = document.getElementById('wrongHostKeyBtn');
     const allowUnsafe = document.getElementById('allowUnsafe');
     const verbose = document.getElementById('verbose');
 
@@ -109,6 +106,9 @@
     function refreshButtons() {
       const protectedEnabled = ((kxOK && reqSignOK) || allowUnsafe.checked);
       loginBtn.disabled = !protectedEnabled;
+      badReqDigestBtn.disabled = !protectedEnabled;
+      badRespDigestBtn.disabled = !protectedEnabled;
+      wrongHostKeyBtn.disabled = !protectedEnabled;
     }
 
     allowUnsafe.addEventListener('change', refreshButtons);
@@ -189,7 +189,7 @@
       return await ce.encrypt(jweKey);
     }
 
-    async function doProtectedOnce() {
+    async function doProtectedOnce(demo = '') {
       if (!(kxOK && reqSignOK) && !allowUnsafe.checked) {
         throw new Error('Protected flow not ready. Check logs.');
       }
@@ -214,10 +214,12 @@
       };
       const bodyStr = JSON.stringify(bodyObj);
 
-      pageLog('Sending POST /api/login');
+      const url = demo ? `/api/login?demo=${encodeURIComponent(demo)}` : '/api/login';
+      pageLog('Sending POST', url);
 
-      const r = await fetch('/api/login', {
+      const r = await fetch(url, {
         method: 'POST',
+        cache: 'no-store',
         headers: {
           'Content-Type': 'application/json'
         },
@@ -234,17 +236,49 @@
         j = JSON.parse(txt);
       } catch {}
 
-      return { ok: !!j?.ok, status: r.status };
+      return { ok: !!j?.ok, status: r.status, text: txt };
     }
 
-    async function doLogin() {
-      const res = await doProtectedOnce();
+    async function doLoginNormal() {
+      const res = await doProtectedOnce('');
       if (res.ok) {
         pageLog('Login OK → redirect /index.html');
         location.href = '/index.html';
       } else {
-        pageLog('Login failed (ok=false)');
+        pageLog('Login failed');
         alert('Login failed. See log.');
+      }
+    }
+
+    async function doWrongRequestDigest() {
+      const res = await doProtectedOnce('req-bad-digest');
+      if (!res.ok) {
+        pageLog('Wrong request digest demo complete. Check host logs for received vs expected request digest.');
+      }
+    }
+
+    async function doWrongResponseDigest() {
+      const res = await doProtectedOnce('resp-bad-digest');
+      if (!res.ok) {
+        pageLog('Wrong response digest demo complete. Check SW logs above for received vs computed response digest.');
+      }
+    }
+
+    async function doWrongHostKeyDemo() {
+      const active = await swActive();
+      if (!active) {
+        throw new Error('No active Service Worker');
+      }
+
+      pageLog('Running wrong host key demo for /req-key/register');
+      const msgPromise = waitForSWMessage('HOST_WRONG_CLIENT_KEY_DEMO_DONE', 10000);
+      active.postMessage({ type: 'RUN_HOST_WRONG_CLIENT_KEY_DEMO' });
+      const msg = await msgPromise;
+
+      if (msg.ok) {
+        pageLog('Wrong host key demo complete. The SW detected that the host returned a different public key hash/thumbprint.');
+      } else {
+        pageLog('Wrong host key demo unexpected result:', msg.message || 'unknown');
       }
     }
 
@@ -252,9 +286,33 @@
 
     loginBtn.addEventListener('click', e => {
       e.preventDefault();
-      doLogin().catch(err => {
+      doLoginNormal().catch(err => {
         pageLog('Login ERROR:', err.message || String(err));
         alert('Login error: ' + (err.message || err));
+      });
+    });
+
+    badReqDigestBtn.addEventListener('click', e => {
+      e.preventDefault();
+      doWrongRequestDigest().catch(err => {
+        pageLog('Wrong request digest ERROR:', err.message || String(err));
+        alert('Request digest demo error: ' + (err.message || err));
+      });
+    });
+
+    badRespDigestBtn.addEventListener('click', e => {
+      e.preventDefault();
+      doWrongResponseDigest().catch(err => {
+        pageLog('Wrong response digest ERROR:', err.message || String(err));
+        alert('Response digest demo error: ' + (err.message || err));
+      });
+    });
+
+    wrongHostKeyBtn.addEventListener('click', e => {
+      e.preventDefault();
+      doWrongHostKeyDemo().catch(err => {
+        pageLog('Wrong host key demo ERROR:', err.message || String(err));
+        alert('Wrong host key demo error: ' + (err.message || err));
       });
     });
 </script>
