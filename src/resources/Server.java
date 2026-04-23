@@ -1,736 +1,934 @@
-// www/sw.js
-let SIG_VERIFY_KEY = null;
-let SIG_VERIFY_KID = null;
+// src/main/java/Server.java
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.Filter;
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpContext;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import org.jose4j.jwe.ContentEncryptionAlgorithmIdentifiers;
+import org.jose4j.jwe.JsonWebEncryption;
+import org.jose4j.jwe.KeyManagementAlgorithmIdentifiers;
+import org.jose4j.jwk.JsonWebKey;
+import org.jose4j.jwk.RsaJsonWebKey;
+import org.jose4j.jwk.RsaJwkGenerator;
+import org.jose4j.lang.JoseException;
 
-let REQ_SIGN_KEYPAIR = null;
-let REQ_SIGN_KID = null;
-let REQ_SIGN_THUMBPRINT = null;
-let REQ_SIGN_READY = false;
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.interfaces.RSAPrivateKey;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.MGF1ParameterSpec;
+import java.security.spec.PSSParameterSpec;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-let HOST_JWE_JWK = null;
-let HOST_JWE_KID = null;
-let PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
+public class Server {
 
-const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Map<String, RSAPublicKey> CLIENT_REQ_PUBS = new ConcurrentHashMap<>();
 
-        const BOOTSTRAP_PATHS = new Set([
-                                                '/sw.js',
-                                                '/Installer.js',
-                                                '/installer.js',
-                                                ]);
+    private static RSAPublicKey WRONG_CLIENT_REQ_VERIFY_PUB;
+    private static RSAPublicKey JWE_PUB;
+    private static RSAPrivateKey JWE_PRIV;
+    private static String JWE_KID = "host-jwe-key-1";
+    private static RSAPublicKey SIG_PUB;
+    private static RSAPrivateKey SIG_PRIV;
 
-function log(...args) {
-  const msg = args.join(' ');
-    console.log('[SW]', msg);
+    public static void main(String[] args) throws Exception {
+        rotateJweKeypair();
 
-    self.clients.matchAll({ includeUncontrolled: true }).then(clients => {
-    for (const client of clients) {
-        client.postMessage({
-                type: 'SW_LOG',
-                message: msg,
-                ts: new Date().toISOString()
-      });
+        String jwkJson = Files.readString(Paths.get("sig-key.jwk.json"), StandardCharsets.UTF_8);
+        RsaJsonWebKey sigJwk = (RsaJsonWebKey) JsonWebKey.Factory.newJwk(jwkJson);
+        SIG_PUB = (RSAPublicKey) sigJwk.getPublicKey();
+        SIG_PRIV = (RSAPrivateKey) sigJwk.getPrivateKey();
+
+        System.out.println("== Host starting ==");
+        System.out.println("JWE key: " + JWE_KID);
+        System.out.println("SIG key: " + sigJwk.getKeyId());
+
+        HttpServer http = HttpServer.create(new InetSocketAddress("0.0.0.0", 8080), 0);
+        List<HttpContext> contexts = new ArrayList<>();
+
+        contexts.add(http.createContext("/", Server::handleFile));
+        contexts.add(http.createContext("/login.html", Server::handleFile));
+        contexts.add(http.createContext("/index.html", Server::handleFile));
+        contexts.add(http.createContext("/styles.css", Server::handleFile));
+        contexts.add(http.createContext("/sig-pub", Server::handleSigPub));
+        contexts.add(http.createContext("/key-exchange", Server::handleKeyExchange));
+        contexts.add(http.createContext("/api/login", Server::handleLogin));
+        contexts.add(http.createContext("/req-key/register", Server::handleReqKeyRegister));
+
+        HttpContext ctxEcho = http.createContext("/api/echo", Server::handleEcho);
+        HttpContext secured1 = http.createContext("/secured/index.html", Server::handleFile);
+
+        SessionFilter sessionFilter = new SessionFilter();
+        ctxEcho.getFilters().add(sessionFilter);
+        secured1.getFilters().add(sessionFilter);
+
+        contexts.addAll(List.of(ctxEcho, secured1));
+
+        for (HttpContext ctx : contexts) {
+            ctx.getFilters().add(new ResponseSignerFilter());
+        }
+
+        http.setExecutor(null);
+        http.start();
+        System.out.println("HTTP server running on http://0.0.0.0:8080");
     }
-  });
-}
 
-function logJson(title, obj) {
-    log(`${title}\n${JSON.stringify(obj, null, 2)}`);
-}
+    private static void handleFile(HttpExchange ex) {
+        try {
+            String path = ex.getRequestURI().getPath();
+            if ("/".equals(path)) {
+                path = "/login.html";
+            }
 
-function normalizeDemo(mode) {
-    return String(mode || '').trim().toLowerCase();
-}
+            File file = new File("www" + path);
+            if (!file.exists() || file.isDirectory()) {
+                ex.setAttribute("handlerResult", HandlerResult.text(404, "Not Found"));
+                return;
+            }
 
-function getDemoForApi(url) {
-    if (url.pathname !== '/api/login' && url.pathname !== '/api/echo') {
-        return '';
+            if (path.startsWith("/unsigned/") || path.equals("/baseline.html")) {
+                ex.setAttribute("disableSigning", Boolean.TRUE);
+            }
+
+            byte[] data = Files.readAllBytes(file.toPath());
+            String ct = contentType(path);
+            ex.setAttribute("handlerResult", HandlerResult.bytes(200, ct, data));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
     }
-    return normalizeDemo(url.searchParams.get('demo'));
-}
 
-function shouldBypassSecurity(url) {
-    return url.pathname.startsWith('/unsigned/');
-}
+    private static void handleSigPub(HttpExchange ex) {
+        try {
+            long now = System.currentTimeMillis() / 1000L;
+            long exp = now + 86400;
 
-function shouldSignRequest(url, method) {
-    method = String(method || 'GET').toUpperCase();
-    if (method === 'GET' || method === 'HEAD') return false;
+            String n = b64urlUnsigned(SIG_PUB.getModulus().toByteArray());
+            String e = b64urlUnsigned(SIG_PUB.getPublicExponent().toByteArray());
 
-    return (
-            url.pathname === '/api/login' ||
-                    url.pathname === '/api/echo'
-    );
-}
+            String json =
+                    "{"
+                            + "\"kty\":\"RSA\","
+                            + "\"kid\":\"sig-key-1\","
+                            + "\"use\":\"sig\","
+                            + "\"alg\":\"PS256\","
+                            + "\"created\":" + now + ","
+                            + "\"expires\":" + exp + ","
+                            + "\"n\":\"" + n + "\","
+                            + "\"e\":\"" + e + "\""
+                            + "}";
 
-self.addEventListener('install', () => {
-log('install → skipWaiting');
-  self.skipWaiting();
-});
-
-        self.addEventListener('activate', event => {
-    log('activate → clients.claim');
-    event.waitUntil(self.clients.claim());
-});
-
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-    return Uint8Array.from(bin, c => c.charCodeAt(0));
-}
-
-function bytesToB64(bytes) {
-    let bin = '';
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  const chunkSize = 0x8000;
-    for (let i = 0; i < arr.length; i += chunkSize) {
-        bin += String.fromCharCode(...arr.subarray(i, i + chunkSize));
+            ex.setAttribute("handlerResult", HandlerResult.json(json));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
     }
-    return btoa(bin);
-}
 
-function bytesToB64Url(bytes) {
-    return bytesToB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
+    private static void handleKeyExchange(HttpExchange ex) {
+        try {
+            String n = b64urlUnsigned(JWE_PUB.getModulus().toByteArray());
+            String e = b64urlUnsigned(JWE_PUB.getPublicExponent().toByteArray());
+            String body = "{\"kty\":\"RSA\",\"kid\":\"" + JWE_KID + "\",\"n\":\"" + n + "\",\"e\":\"" + e + "\"}";
+            ex.setAttribute("handlerResult", HandlerResult.json(body));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
 
-function parseDigestHeader(cd) {
-  const m = cd?.match(/sha-256=:(.+):/i);
-    return m ? m[1] : null;
-}
+    private static void handleReqKeyRegister(HttpExchange ex) {
+        try {
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
+                return;
+            }
 
-function parseSigHeader(sig) {
-  const m = sig?.match(/sig1=:(.+):/i);
-    return m ? m[1] : null;
-}
+            String demo = normalizeDemo(getQueryParam(ex.getRequestURI().getRawQuery(), "demo"));
 
-function isProtectedContentType(ct) {
-    ct = (ct || '').toLowerCase();
-    return (
-            ct.includes('text/html') ||
-                    ct.includes('application/json') ||
-                    ct.includes('application/javascript') ||
-                    ct.includes('text/javascript') ||
-                    ct.includes('text/css') ||
-                    ct.includes('image/png') ||
-                    ct.includes('image/jpeg') ||
-                    ct.includes('image/webp') ||
-                    ct.includes('image/svg+xml')
-    );
-}
+            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            Map<String, Object> req = tryParseJsonMap(body);
 
-async function computeDigestHeader(bodyBytes) {
-  const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
-    return 'sha-256=:' + bytesToB64(actualHash) + ':';
-}
+            String kid = stringValue(req.get("kid"));
+            String suppliedThumbprint = stringValue(req.get("jwkThumbprint"));
+            String proofB64 = stringValue(req.get("proof"));
+            Object jwkObj = req.get("jwk");
 
-function buildResponseSignatureBase(response, method, targetUri) {
-  const cd = response.headers.get('Content-Digest');
-  const sigInput = response.headers.get('Signature-Input');
+            if (kid == null || kid.isBlank()
+                    || suppliedThumbprint == null || suppliedThumbprint.isBlank()
+                    || proofB64 == null || proofB64.isBlank()
+                    || jwkObj == null) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "Missing kid/jwk/jwkThumbprint/proof"));
+                return;
+            }
 
-    if (!cd || !sigInput) {
+            String jwkJson = MAPPER.writeValueAsString(jwkObj);
+            RsaJsonWebKey clientJwk = (RsaJsonWebKey) JsonWebKey.Factory.newJwk(jwkJson);
+            RSAPublicKey clientPub = (RSAPublicKey) clientJwk.getPublicKey();
+
+            String computedThumbprint = computeReqSignJwkThumbprint(clientJwk);
+            if (!computedThumbprint.equals(suppliedThumbprint)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "JWK thumbprint mismatch"));
+                return;
+            }
+
+            String proofBase = buildReqKeyRegistrationProofBase(kid, computedThumbprint);
+            if (!verifyReqKeyRegistrationProof(clientPub, proofBase, proofB64)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad registration proof"));
+                return;
+            }
+
+            RSAPublicKey storedPub = clientPub;
+            String acceptedThumbprint = computedThumbprint;
+
+            if ("host-wrong-client-key".equals(demo)) {
+                storedPub = wrongClientReqVerifyPublicKey();
+                acceptedThumbprint = computeReqSignJwkThumbprint(storedPub);
+
+                System.out.println("[REQ-KEY-REGISTER] DEMO wrong host key active");
+                System.out.println("[REQ-KEY-REGISTER] client kid              = " + kid);
+                System.out.println("[REQ-KEY-REGISTER] client sent thumbprint  = " + computedThumbprint);
+                System.out.println("[REQ-KEY-REGISTER] host stored thumbprint  = " + acceptedThumbprint);
+            } else {
+                System.out.println("[REQ-KEY-REGISTER] normal");
+                System.out.println("[REQ-KEY-REGISTER] client kid              = " + kid);
+                System.out.println("[REQ-KEY-REGISTER] accepted thumbprint     = " + acceptedThumbprint);
+            }
+
+            CLIENT_REQ_PUBS.put(kid, storedPub);
+
+            String resp =
+                    "{"
+                            + "\"ok\":true,"
+                            + "\"acceptedKid\":\"" + json(kid) + "\","
+                            + "\"acceptedThumbprint\":\"" + json(acceptedThumbprint) + "\""
+                            + "}";
+
+            ex.setAttribute("handlerResult", HandlerResult.json(resp));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
+    private static boolean verifyClientSignedRequest(HttpExchange ex, byte[] bodyBytes) {
+        try {
+            String kid = headerFirst(ex, "X-Client-Key-Id");
+            String created = headerFirst(ex, "X-Req-Created");
+            String cd = headerFirst(ex, "X-Req-Content-Digest");
+            String sigB64 = headerFirst(ex, "X-Req-Signature");
+
+            System.out.println("[REQ-VERIFY] endpoint=" + ex.getRequestURI());
+
+            if (kid == null || created == null || cd == null || sigB64 == null) {
+                System.out.println("[REQ-VERIFY] FAIL missing signing headers");
+                return false;
+            }
+
+            long createdSec;
+            try {
+                createdSec = Long.parseLong(created);
+            } catch (Exception e) {
+                System.out.println("[REQ-VERIFY] FAIL bad X-Req-Created");
+                return false;
+            }
+
+            long nowSec = System.currentTimeMillis() / 1000L;
+            if (Math.abs(nowSec - createdSec) > 300) {
+                System.out.println("[REQ-VERIFY] FAIL X-Req-Created outside allowed window");
+                return false;
+            }
+
+            RSAPublicKey pub = CLIENT_REQ_PUBS.get(kid);
+            if (pub == null) {
+                System.out.println("[REQ-VERIFY] FAIL unknown client key id: " + kid);
+                return false;
+            }
+
+            String expectedCd = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(bodyBytes)) + ":";
+
+            System.out.println("[REQ-VERIFY] received digest = " + cd);
+            System.out.println("[REQ-VERIFY] expected digest = " + expectedCd);
+
+            if (!expectedCd.equals(cd)) {
+                System.out.println("[REQ-VERIFY] FAIL request content digest mismatch");
+                return false;
+            }
+
+            String method = ex.getRequestMethod().toLowerCase(Locale.ROOT);
+            String target = ex.getRequestURI().toString();
+
+            String base =
+                    "\"@method\": \"" + method + "\"\n"
+                            + "\"@target-uri\": \"" + target + "\"\n"
+                            + "\"x-req-created\": " + created + "\n"
+                            + "\"x-req-content-digest\": " + cd + "\n"
+                            + "\"x-client-key-id\": " + kid;
+
+            Signature s = Signature.getInstance("RSASSA-PSS");
+            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.initVerify(pub);
+            s.update(base.getBytes(StandardCharsets.UTF_8));
+
+            boolean ok = s.verify(Base64.getDecoder().decode(sigB64));
+
+            System.out.println("[REQ-VERIFY] signature base:");
+            System.out.println(base);
+            System.out.println("[REQ-VERIFY] signature valid = " + ok);
+
+            if (!ok) {
+                System.out.println("[REQ-VERIFY] FAIL request signature verification failed");
+            } else {
+                System.out.println("[REQ-VERIFY] OK");
+            }
+
+            return ok;
+        } catch (Exception e) {
+            System.out.println("[REQ-VERIFY] FAIL exception: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static void handleLoginPlain(HttpExchange ex) {
+        try {
+            ex.setAttribute("disableSigning", Boolean.TRUE);
+
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
+                return;
+            }
+
+            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            Map<String, Object> bodyMap = tryParseJsonMap(body);
+
+            String user = bodyMap.getOrDefault("username", "").toString();
+            String pass = bodyMap.getOrDefault("password", "").toString();
+
+            boolean success = "alice".equals(user) && "secret".equals(pass);
+            String respJson = success ? "{\"ok\":true}" : "{\"ok\":false}";
+            ex.setAttribute("handlerResult", HandlerResult.json(respJson));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
+    private static void handleLogin(HttpExchange ex) {
+        try {
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
+                return;
+            }
+
+            byte[] bodyBytes = ex.getRequestBody().readAllBytes();
+            String body = new String(bodyBytes, StandardCharsets.UTF_8);
+
+            logReqSigningHeaders(ex, "/api/login");
+
+            if (!verifyClientSignedRequest(ex, bodyBytes)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad client request signature"));
+                return;
+            }
+
+            String usernameEnc = jsonField(body, "username");
+            String passwordEnc = jsonField(body, "password");
+
+            String user = tryDecryptAndValidate(usernameEnc);
+            String pass = tryDecryptAndValidate(passwordEnc);
+
+            boolean success = "alice".equals(user) && "secret".equals(pass);
+            HandlerResult hr;
+
+            if (success) {
+                long now = System.currentTimeMillis() / 1000L;
+                long exp = now + 1800;
+                String session = "{\"u\":\"" + json(user) + "\",\"role\":\"admin\",\"iat\":" + now + ",\"exp\":" + exp + "}";
+                String cookieVal = jweEncrypt(session);
+                CookieOptions opts = CookieOptions.defaultSession(1800);
+                setCookie(ex, "sess", cookieVal, opts);
+                hr = HandlerResult.json("{\"ok\":true}");
+            } else {
+                hr = HandlerResult.json("{\"ok\":false}");
+            }
+
+            ex.setAttribute("handlerResult", hr);
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
+    private static void handleEcho(HttpExchange ex) {
+        try {
+            byte[] rawBytes = ex.getRequestBody().readAllBytes();
+            String rawBody = new String(rawBytes, StandardCharsets.UTF_8);
+
+            logReqSigningHeaders(ex, "/api/echo");
+
+            if (!verifyClientSignedRequest(ex, rawBytes)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad client request signature"));
+                return;
+            }
+
+            Map<String, Object> resp = new LinkedHashMap<>();
+
+            Map<String, Object> req = new LinkedHashMap<>();
+            req.put("method", ex.getRequestMethod());
+            req.put("path", ex.getRequestURI().toString());
+            resp.put("request", req);
+
+            Map<String, Object> session = new LinkedHashMap<>();
+            session.put("user", ex.getAttribute("session.user"));
+            resp.put("session", session);
+
+            Map<String, Object> client = new LinkedHashMap<>();
+            client.put("origin", headerFirst(ex, "Origin"));
+            client.put("referer", headerFirst(ex, "Referer"));
+            client.put("userAgent", headerFirst(ex, "User-agent"));
+            client.put("xForwardedFor", headerFirst(ex, "X-forwarded-for"));
+            client.put("xForwardedProto", headerFirst(ex, "X-forwarded-proto"));
+            client.put("xForwardedHost", headerFirst(ex, "X-forwarded-host"));
+            client.put("xForwardedServer", headerFirst(ex, "X-forwarded-server"));
+            resp.put("client", client);
+
+            Map<String, Object> headers = new LinkedHashMap<>();
+            headers.put("interesting", pickInterestingHeaders(ex));
+            headers.put("all", flattenHeaders(ex.getRequestHeaders()));
+            resp.put("headers", headers);
+
+            Object parsedBody = tryParseJson(rawBody);
+            resp.put("body", parsedBody);
+
+            Map<String, Object> decrypted = new LinkedHashMap<>();
+            List<String> notes = new ArrayList<>();
+
+            if (parsedBody instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> bodyMap = (Map<String, Object>) parsedBody;
+                decryptIfJweString(bodyMap, "name", decrypted, notes);
+                decryptIfJweString(bodyMap, "message", decrypted, notes);
+                decryptIfJweString(bodyMap, "username", decrypted, notes);
+                decryptIfJweString(bodyMap, "password", decrypted, notes);
+            } else {
+                notes.add("Body is not a JSON object; cannot field-decrypt.");
+            }
+
+            String encHdr = headerFirst(ex, "X-Enc-X-Custom");
+            if (encHdr != null) {
+                String dec = tryDecryptAndValidate("JWE: " + encHdr);
+                if (dec != null) {
+                    decrypted.put("X-Enc-X-Custom", dec);
+                } else {
+                    notes.add("Failed to decrypt header X-Enc-X-Custom");
+                }
+            }
+
+            if (!decrypted.isEmpty()) {
+                resp.put("decrypted", decrypted);
+            }
+            if (!notes.isEmpty()) {
+                resp.put("notes", notes);
+            }
+
+            String json = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(resp);
+            ex.setAttribute("handlerResult", HandlerResult.json(json));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
+    static class ResponseSignerFilter extends Filter {
+        @Override
+        public String description() {
+            return "Signs responses";
+        }
+
+        @Override
+        public void doFilter(HttpExchange ex, Chain chain) throws IOException {
+            chain.doFilter(ex);
+
+            HandlerResult result = (HandlerResult) ex.getAttribute("handlerResult");
+            if (result == null) {
+                result = HandlerResult.text(500, "Missing response");
+            }
+
+            boolean disableSigning = Boolean.TRUE.equals(ex.getAttribute("disableSigning"))
+                    || ex.getRequestURI().getPath().equals("/api/login_plain")
+                    || ex.getRequestURI().getPath().startsWith("/unsigned/");
+
+            Headers h = ex.getResponseHeaders();
+
+            if (disableSigning) {
+                h.set("Content-Type", result.contentType);
+                h.set("Connection", "close");
+
+                ex.sendResponseHeaders(result.status, result.body.length);
+                try (OutputStream os = ex.getResponseBody()) {
+                    os.write(result.body);
+                }
+                return;
+            }
+
+            String demo = "";
+            String path = ex.getRequestURI().getPath();
+            if ("/api/login".equals(path) || "/api/echo".equals(path)) {
+                demo = normalizeDemo(getQueryParam(ex.getRequestURI().getRawQuery(), "demo"));
+            }
+
+            byte[] sendBody = result.body;
+            int status = result.status;
+
+            String correctDigest = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(sendBody)) + ":";
+            long created = System.currentTimeMillis() / 1000L;
+            String method = ex.getRequestMethod().toLowerCase(Locale.ROOT);
+            String target = ex.getRequestURI().toString();
+
+            String sigInput =
+                    "(\"@method\" \"@target-uri\" \"@status\" \"content-digest\");"
+                            + "created=" + created + ";"
+                            + "keyid=\"sig-key-1\";"
+                            + "alg=\"rsa-pss-sha256\"";
+
+            String base =
+                    "\"@method\": \"" + method + "\"\n"
+                            + "\"@target-uri\": \"" + target + "\"\n"
+                            + "\"@status\": " + status + "\n"
+                            + "content-digest: " + correctDigest + "\n"
+                            + "\"@signature-params\": " + sigInput;
+
+            String sigB64;
+            try {
+                byte[] sig = signPss(base.getBytes(StandardCharsets.US_ASCII), SIG_PRIV);
+                sigB64 = Base64.getEncoder().encodeToString(sig);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+
+            String sendDigest = correctDigest;
+            if ("resp-bad-digest".equals(demo)) {
+                sendDigest = "sha-256=:" + Base64.getEncoder().encodeToString(new byte[32]) + ":";
+                System.out.println("[RESP-SEND] demo wrong response digest active");
+                System.out.println("[RESP-SEND] actual digest = " + correctDigest);
+                System.out.println("[RESP-SEND] sent   digest = " + sendDigest);
+            } else {
+                System.out.println("[RESP-SEND] normal response digest = " + correctDigest);
+            }
+
+            h.set("Content-Type", result.contentType);
+            h.set("Connection", "close");
+            h.set("Content-Digest", sendDigest);
+            h.set("Signature-Input", "sig1=" + sigInput);
+            h.set("Signature", "sig1=:" + sigB64 + ":");
+
+            ex.sendResponseHeaders(status, sendBody.length);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(sendBody);
+            }
+        }
+    }
+
+    static class SessionFilter extends Filter {
+        @Override
+        public String description() {
+            return "sess";
+        }
+
+        @Override
+        public void doFilter(HttpExchange ex, Chain c) throws IOException {
+            String s = getCookie(ex, "sess");
+            if (s != null) {
+                String p = jweDecrypt(s);
+                if (p != null) {
+                    ex.setAttribute("session.user", jsonField(p, "u"));
+                }
+            }
+            c.doFilter(ex);
+        }
+    }
+
+    static class CookieOptions {
+        String path = "/";
+        boolean httpOnly = true;
+        boolean secure = true;
+        Long maxAgeSeconds = null;
+
+        static CookieOptions defaultSession(long secs) {
+            CookieOptions o = new CookieOptions();
+            o.maxAgeSeconds = secs;
+            return o;
+        }
+    }
+
+    static void setCookie(HttpExchange ex, String name, String value, CookieOptions o) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(name).append("=").append(value != null ? value : "");
+        if (o.path != null) {
+            sb.append("; Path=").append(o.path);
+        }
+        if (o.maxAgeSeconds != null) {
+            sb.append("; Max-Age=").append(o.maxAgeSeconds);
+            ZonedDateTime exp = ZonedDateTime.now(ZoneOffset.UTC).plusSeconds(o.maxAgeSeconds);
+            String date = DateTimeFormatter.RFC_1123_DATE_TIME.format(exp);
+            sb.append("; Expires=").append(date);
+        }
+        if (o.secure) {
+            sb.append("; Secure");
+        }
+        if (o.httpOnly) {
+            sb.append("; HttpOnly");
+        }
+        ex.getResponseHeaders().add("Set-Cookie", sb.toString());
+    }
+
+    static String getCookie(HttpExchange ex, String name) {
+        List<String> headers = ex.getRequestHeaders().get("Cookie");
+        if (headers == null) {
+            return null;
+        }
+        for (String h : headers) {
+            for (String part : h.split(";")) {
+                String[] nv = part.trim().split("=", 2);
+                if (nv.length == 2 && nv[0].trim().equals(name)) {
+                    return nv[1].trim();
+                }
+            }
+        }
         return null;
     }
 
-  const params = sigInput.replace(/^sig1=/, '');
-    return (
-    `"@method": "${String(method).toLowerCase()}"\n` +
-    `"@target-uri": "${targetUri}"\n` +
-    `"@status": ${response.status}\n` +
-    `content-digest: ${cd}\n` +
-    `"@signature-params": ${params}`
-  );
-}
-
-async function buildResponseVerifyLog(response, bodyBytes, method, targetUri) {
-  const contentDigest = response.headers.get('Content-Digest');
-  const signature = response.headers.get('Signature');
-  const signatureInput = response.headers.get('Signature-Input');
-  const computedDigest = await computeDigestHeader(bodyBytes);
-  const signatureBase = buildResponseSignatureBase(response, method, targetUri);
-
-  const info = {
-            method,
-            targetUri,
-            status: response.status,
-            receivedDigest: contentDigest,
-            computedDigest,
-            digestMatches: contentDigest === computedDigest,
-            verificationKeyId: SIG_VERIFY_KID,
-            signatureInput,
-            signature,
-            signatureBase,
-            signatureValid: null
-  };
-
-    if (!contentDigest || !signature || !signatureInput) {
-        info.error = 'missing security headers';
-        return info;
+    private static void rotateJweKeypair() throws Exception {
+        RsaJsonWebKey j = RsaJwkGenerator.generateJwk(2048);
+        JWE_PUB = (RSAPublicKey) j.getPublicKey();
+        JWE_PRIV = (RSAPrivateKey) j.getPrivateKey();
     }
 
-  const digestB64 = parseDigestHeader(contentDigest);
-    if (!digestB64) {
-        info.error = 'bad Content-Digest format';
-        return info;
+    private static String jweEncrypt(String json) throws JoseException {
+        JsonWebEncryption jwe = new JsonWebEncryption();
+        jwe.setPayload(json);
+        jwe.setAlgorithmHeaderValue(KeyManagementAlgorithmIdentifiers.RSA_OAEP_256);
+        jwe.setEncryptionMethodHeaderParameter(ContentEncryptionAlgorithmIdentifiers.AES_256_GCM);
+        jwe.setKey(JWE_PUB);
+        jwe.setKeyIdHeaderValue(JWE_KID);
+        return jwe.getCompactSerialization();
     }
 
-    if (contentDigest !== computedDigest) {
-        info.error = 'digest mismatch';
-        return info;
-    }
-
-  const sigB64 = parseSigHeader(signature);
-    if (!sigB64) {
-        info.error = 'bad Signature format';
-        return info;
-    }
-
-  const ok = await crypto.subtle.verify(
-            { name: 'RSA-PSS', saltLength: 32 },
-    SIG_VERIFY_KEY,
-            b64ToBytes(sigB64),
-            new TextEncoder().encode(signatureBase)
-  );
-
-    info.signatureValid = ok;
-    if (!ok) {
-        info.error = 'signature verification failed';
-    }
-
-    return info;
-}
-
-async function verifyResponse(response, bodyBytes, method, targetUri) {
-    if (!SIG_VERIFY_KEY) {
-        throw new Error('verification key not installed');
-    }
-
-  const info = await buildResponseVerifyLog(response, bodyBytes, method, targetUri);
-    logJson(info.error ? 'Response verification FAILED' : 'Response verification OK', info);
-
-    if (info.error) {
-        throw new Error(info.error);
-    }
-}
-
-async function fetchVerifiedJson(method, targetUri, init = {}) {
-        if (!SIG_VERIFY_KEY) {
-        throw new Error('verification key not installed yet');
-  }
-
-          const r = await fetch(APP_ORIGIN + targetUri, {
-    method,
-            mode: 'cors',
-            cache: 'no-store',
-            redirect: 'follow',
-            credentials: 'omit',
-    ...init
-});
-
-        const bodyBytes = await r.clone().arrayBuffer();
-await verifyResponse(r, bodyBytes, method, targetUri);
-
-  if (!r.ok) {
-        throw new Error(`${targetUri} failed HTTP ${r.status}`);
-        }
-
-        return JSON.parse(new TextDecoder().decode(bodyBytes));
-        }
-
-function canonicalizeReqSignPublicJwk(jwk) {
-    if (!jwk || jwk.kty !== 'RSA' || !jwk.n || !jwk.e) {
-        throw new Error('invalid request-sign public JWK');
-    }
-
-    return JSON.stringify({
-            e: jwk.e,
-            kty: 'RSA',
-            n: jwk.n
-  });
-}
-
-async function computeReqSignJwkThumbprint(jwk) {
-  const canonical = canonicalizeReqSignPublicJwk(jwk);
-  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
-    return bytesToB64Url(hash);
-}
-
-function buildReqKeyRegistrationProofBase(kid, thumbprint) {
-    return (
-    `"kid": "${kid}"\n` +
-    `"thumbprint": "${thumbprint}"`
-  );
-}
-
-async function generateReqSigningKeypair() {
-    if (REQ_SIGN_KEYPAIR) {
-    const jwk = await crypto.subtle.exportKey('jwk', REQ_SIGN_KEYPAIR.publicKey);
-        jwk.alg = 'PS256';
-        jwk.use = 'sig';
-        jwk.kid = REQ_SIGN_KID;
-
-        return {
-                kid: REQ_SIGN_KID,
-                jwk,
-                privateKey: REQ_SIGN_KEYPAIR.privateKey,
-                reused: true
-    };
-    }
-
-    REQ_SIGN_KID = 'sw-req-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-
-    REQ_SIGN_KEYPAIR = await crypto.subtle.generateKey(
-            {
-                    name: 'RSA-PSS',
-            modulusLength: 2048,
-            publicExponent: new Uint8Array([1, 0, 1]),
-    hash: 'SHA-256'
-    },
-    true,
-    ['sign', 'verify']
-  );
-
-  const jwk = await crypto.subtle.exportKey('jwk', REQ_SIGN_KEYPAIR.publicKey);
-    jwk.alg = 'PS256';
-    jwk.use = 'sig';
-    jwk.kid = REQ_SIGN_KID;
-
-    return {
-            kid: REQ_SIGN_KID,
-            jwk,
-            privateKey: REQ_SIGN_KEYPAIR.privateKey,
-            reused: false
-  };
-}
-
-async function generateEphemeralReqSigningKeypair() {
-  const kid = 'sw-demo-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-
-  const keypair = await crypto.subtle.generateKey(
-            {
-                    name: 'RSA-PSS',
-            modulusLength: 2048,
-            publicExponent: new Uint8Array([1, 0, 1]),
-    hash: 'SHA-256'
-    },
-    true,
-    ['sign', 'verify']
-  );
-
-  const jwk = await crypto.subtle.exportKey('jwk', keypair.publicKey);
-    jwk.alg = 'PS256';
-    jwk.use = 'sig';
-    jwk.kid = kid;
-
-    return {
-            kid,
-            jwk,
-            privateKey: keypair.privateKey,
-            reused: false
-  };
-}
-
-async function fetchVerifiedHostJweJwk() {
-    if (!SIG_VERIFY_KEY) {
-        throw new Error('verification key not installed yet');
-    }
-
-  const targetUri = '/key-exchange';
-  const upstreamUrl = APP_ORIGIN + targetUri;
-
-  const r = await fetch(upstreamUrl, {
-            method: 'GET',
-            mode: 'cors',
-            cache: 'no-store',
-            redirect: 'follow',
-            credentials: 'omit'
-  });
-
-    if (!r.ok) {
-        throw new Error('key-exchange failed HTTP ' + r.status);
-    }
-
-  const bodyBytes = await r.clone().arrayBuffer();
-    await verifyResponse(r, bodyBytes, 'GET', targetUri);
-
-  const jwk = JSON.parse(new TextDecoder().decode(bodyBytes));
-    if (!jwk || !jwk.n || !jwk.e) {
-        throw new Error('invalid host JWE key');
-    }
-
-    HOST_JWE_JWK = jwk;
-    HOST_JWE_KID = jwk.kid || '(no-kid)';
-    log('verified host JWE key fetched (kid=' + HOST_JWE_KID + ')');
-
-    return jwk;
-}
-
-async function registerReqSigningKeyWithServer(demo = '', ephemeral = false) {
-  const hostJwk = HOST_JWE_JWK || await fetchVerifiedHostJweJwk();
-  const material = ephemeral
-            ? await generateEphemeralReqSigningKeypair()
-    : await generateReqSigningKeypair();
-
-  const thumbprint = await computeReqSignJwkThumbprint(material.jwk);
-  const proofBase = buildReqKeyRegistrationProofBase(material.kid, thumbprint);
-
-  const proofBuf = await crypto.subtle.sign(
-            { name: 'RSA-PSS', saltLength: 32 },
-    material.privateKey,
-            new TextEncoder().encode(proofBase)
-  );
-
-  const targetUri = demo
-            ? '/req-key/register?demo=' + encodeURIComponent(demo)
-            : '/req-key/register';
-
-    log('registering request-sign public key with server (kid=' + material.kid + ', thumb=' + thumbprint + ')');
-
-  const j = await fetchVerifiedJson('POST', targetUri, {
-            headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-            kid: material.kid,
-            jwk: material.jwk,
-            jwkThumbprint: thumbprint,
-            proof: bytesToB64(proofBuf)
-    })
-  });
-
-    log('[REQ-KEY-REGISTER] client thumbprint = ' + thumbprint);
-    log('[REQ-KEY-REGISTER] host   thumbprint = ' + (j?.acceptedThumbprint || '(missing)'));
-
-    if (!j?.ok) {
-        throw new Error('request-sign registration not accepted');
-    }
-
-    if (j.acceptedKid !== material.kid) {
-        throw new Error('request-sign registration kid mismatch');
-    }
-
-    if (j.acceptedThumbprint !== thumbprint) {
-        throw new Error('request-sign registration thumbprint mismatch');
-    }
-
-    if (!ephemeral) {
-        REQ_SIGN_THUMBPRINT = thumbprint;
-        REQ_SIGN_READY = true;
-    }
-
-    return {
-            ok: true,
-            reqSignKid: material.kid,
-            reqSignThumbprint: thumbprint,
-            hostJweKid: hostJwk.kid || '(no-kid)',
-            hostJweJwk: hostJwk,
-            reused: material.reused
-  };
-}
-
-async function ensureProtectedFlowReady() {
-    if (HOST_JWE_JWK && REQ_SIGN_READY && REQ_SIGN_KID && REQ_SIGN_THUMBPRINT) {
-        return {
-                ok: true,
-                reqSignReady: true,
-                reqSignKid: REQ_SIGN_KID,
-                reqSignThumbprint: REQ_SIGN_THUMBPRINT,
-                hostJweKid: HOST_JWE_KID,
-                hostJweJwk: HOST_JWE_JWK,
-                reused: true
-    };
-    }
-
-    if (PROTECTED_FLOW_BOOTSTRAP_PROMISE) {
-        return await PROTECTED_FLOW_BOOTSTRAP_PROMISE;
-    }
-
-    PROTECTED_FLOW_BOOTSTRAP_PROMISE = (async () => {
-            REQ_SIGN_READY = false;
-    REQ_SIGN_THUMBPRINT = null;
-
-    if (!HOST_JWE_JWK) {
-        await fetchVerifiedHostJweJwk();
-    }
-
-    const reg = await registerReqSigningKeyWithServer();
-
-    const out = {
-            ok: true,
-            reqSignReady: true,
-            reqSignKid: reg.reqSignKid,
-            reqSignThumbprint: reg.reqSignThumbprint,
-            hostJweKid: reg.hostJweKid,
-            hostJweJwk: reg.hostJweJwk,
-            reused: reg.reused
-    };
-
-    log('protected-flow ready hostKid=' + out.hostJweKid + ' reqSignKid=' + out.reqSignKid + ' thumb=' + out.reqSignThumbprint);
-    return out;
-  })();
-
-    try {
-        return await PROTECTED_FLOW_BOOTSTRAP_PROMISE;
-    } finally {
-        PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
-    }
-}
-
-self.addEventListener('message', async event => {
-  const type = event.data?.type;
-
-    if (type === 'SET_SIG_KEY') {
+    private static String jweDecrypt(String compact) {
         try {
-            SIG_VERIFY_KEY = await crypto.subtle.importKey(
-                    'jwk',
-                    event.data.jwk,
-                    { name: 'RSA-PSS', hash: 'SHA-256' },
-            false,
-        ['verify']
-      );
-
-            SIG_VERIFY_KID = event.data.jwk?.kid || '?';
-            log('signature verification key installed (kid=' + SIG_VERIFY_KID + ')');
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({ type: 'SIG_KEY_INSTALLED', kid: SIG_VERIFY_KID });
-            }
-        } catch (e) {
-            SIG_VERIFY_KEY = null;
-            SIG_VERIFY_KID = null;
-      const msg = e?.message || String(e);
-            log('ERROR installing signature key: ' + msg);
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({ type: 'SIG_KEY_ERROR', message: msg });
-            }
+            JsonWebEncryption jwe = new JsonWebEncryption();
+            jwe.setCompactSerialization(compact);
+            jwe.setKey(JWE_PRIV);
+            return jwe.getPayload();
+        } catch (Exception e) {
+            return null;
         }
-        return;
     }
 
-    if (type === 'GET_REQ_SIGN_STATUS') {
+    private static byte[] sha256(byte[] in) {
         try {
-      const state = await ensureProtectedFlowReady();
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({
-                        type: 'REQ_SIGN_STATUS',
-                        ready: !!state.reqSignReady,
-                        ok: !!state.ok,
-                        kid: state.reqSignKid || null,
-                        thumbprint: state.reqSignThumbprint || null,
-                        hostJweKid: state.hostJweKid || null
-        });
-            }
-        } catch (e) {
-      const msg = e?.message || String(e);
-            log('ERROR request-sign bootstrap: ' + msg);
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({
-                        type: 'REQ_SIGN_STATUS',
-                        ready: false,
-                        ok: false,
-                        message: msg
-        });
-            }
+            return MessageDigest.getInstance("SHA-256").digest(in);
+        } catch (Exception e) {
+            return new byte[0];
         }
-        return;
     }
 
-    if (type === 'GET_PROTECTED_FLOW_STATE') {
+    private static byte[] signPss(byte[] input, PrivateKey key) throws Exception {
+        Signature s = Signature.getInstance("RSASSA-PSS");
+        s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+        s.initSign(key);
+        s.update(input);
+        return s.sign();
+    }
+
+    private static String b64urlUnsigned(byte[] in) {
+        if (in.length > 1 && in[0] == 0) {
+            in = Arrays.copyOfRange(in, 1, in.length);
+        }
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(in);
+    }
+
+    private static String buildReqKeyRegistrationProofBase(String kid, String thumbprint) {
+        return "\"kid\": \"" + kid + "\"\n"
+                + "\"thumbprint\": \"" + thumbprint + "\"";
+    }
+
+    private static String computeReqSignJwkThumbprint(RsaJsonWebKey jwk) throws Exception {
+        RSAPublicKey pub = (RSAPublicKey) jwk.getPublicKey();
+        return computeReqSignJwkThumbprint(pub);
+    }
+
+    private static String computeReqSignJwkThumbprint(RSAPublicKey pub) throws Exception {
+        String n = b64urlUnsigned(pub.getModulus().toByteArray());
+        String e = b64urlUnsigned(pub.getPublicExponent().toByteArray());
+        String canonical = "{\"e\":\"" + e + "\",\"kty\":\"RSA\",\"n\":\"" + n + "\"}";
+        byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8));
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+    }
+
+    private static boolean verifyReqKeyRegistrationProof(RSAPublicKey pub, String proofBase, String proofB64) {
         try {
-      const state = await ensureProtectedFlowReady();
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({
-                        type: 'PROTECTED_FLOW_STATE',
-          ...state
-        });
-            }
-        } catch (e) {
-      const msg = e?.message || String(e);
-            log('ERROR protected-flow bootstrap: ' + msg);
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({
-                        type: 'PROTECTED_FLOW_STATE',
-                        ok: false,
-                        message: msg
-        });
-            }
+            Signature s = Signature.getInstance("RSASSA-PSS");
+            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.initVerify(pub);
+            s.update(proofBase.getBytes(StandardCharsets.UTF_8));
+            return s.verify(Base64.getDecoder().decode(proofB64));
+        } catch (Exception e) {
+            return false;
         }
-        return;
     }
 
-    if (type === 'RUN_HOST_WRONG_CLIENT_KEY_DEMO') {
+    private static synchronized RSAPublicKey wrongClientReqVerifyPublicKey() throws Exception {
+        if (WRONG_CLIENT_REQ_VERIFY_PUB == null) {
+            KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+            kpg.initialize(2048);
+            WRONG_CLIENT_REQ_VERIFY_PUB = (RSAPublicKey) kpg.generateKeyPair().getPublic();
+        }
+        return WRONG_CLIENT_REQ_VERIFY_PUB;
+    }
+
+    private static String normalizeDemo(String value) {
+        return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static String jsonField(String json, String key) {
+        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\"(.*?)\"", Pattern.DOTALL).matcher(json);
+        return m.find() ? m.group(1) : null;
+    }
+
+    private static String tryDecryptAndValidate(String enc) {
+        if (enc == null) {
+            return null;
+        }
+        if (enc.startsWith("JWE: ")) {
+            enc = enc.substring(5).trim();
+        }
+        String payload = jweDecrypt(enc);
+        if (payload != null && isSafeString(payload)) {
+            return payload;
+        }
+        return null;
+    }
+
+    private static boolean isSafeString(String input) {
+        if (input == null || input.length() > 10000) {
+            return false;
+        }
+        String lower = input.toLowerCase(Locale.ROOT);
+        String[] sql = {"select", "insert", "update", "delete", "--", ";drop ", "xp_"};
+        for (String k : sql) {
+            if (lower.contains(k)) {
+                return false;
+            }
+        }
+        String[] xss = {"<script", "javascript:", "onerror", "onload", "<img", "<iframe"};
+        for (String x : xss) {
+            if (lower.contains(x)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String json(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
+    }
+
+    private static String contentType(String path) {
+        if (path.endsWith(".html")) {
+            return "text/html; charset=utf-8";
+        }
+        if (path.endsWith(".css")) {
+            return "text/css; charset=utf-8";
+        }
+        if (path.endsWith(".js")) {
+            return "application/javascript; charset=utf-8";
+        }
+        if (path.endsWith(".json")) {
+            return "application/json; charset=utf-8";
+        }
+        if (path.endsWith(".png")) {
+            return "image/png";
+        }
+        if (path.endsWith(".jpg") || path.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (path.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (path.endsWith(".svg")) {
+            return "image/svg+xml";
+        }
+        return "application/octet-stream";
+    }
+
+    private static Map<String, Object> tryParseJsonMap(String raw) throws IOException {
+        return MAPPER.readValue(raw, new TypeReference<Map<String, Object>>() {});
+    }
+
+    private static Object tryParseJson(String raw) {
         try {
-            await registerReqSigningKeyWithServer('host-wrong-client-key', true);
-            log('Host wrong client key demo unexpectedly passed');
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({
-                        type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
-                        ok: false,
-                        message: 'Unexpected success'
-        });
-            }
-        } catch (e) {
-      const msg = e?.message || String(e);
-            log('Host wrong client key demo result: ' + msg);
-
-            if (event.source?.postMessage) {
-                event.source.postMessage({
-                        type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
-                        ok: true,
-                        message: msg
-        });
-            }
+            return MAPPER.readValue(raw, Object.class);
+        } catch (Exception ignored) {
+            return raw;
         }
     }
-});
 
-async function addRequestSignature(headers, method, targetUri, bodyBytes) {
-    if (!REQ_SIGN_KEYPAIR || !REQ_SIGN_KID || !REQ_SIGN_READY) {
-        throw new Error('request-signing key not ready');
+    private static void decryptIfJweString(
+            Map<String, Object> bodyMap,
+            String field,
+            Map<String, Object> decryptedOut,
+            List<String> notes
+    ) {
+        Object v = bodyMap.get(field);
+        if (!(v instanceof String)) {
+            return;
+        }
+
+        String s = (String) v;
+        if (!s.startsWith("JWE: ")) {
+            return;
+        }
+
+        String dec = tryDecryptAndValidate(s);
+        if (dec != null) {
+            decryptedOut.put(field, dec);
+        } else {
+            decryptedOut.put(field, "[decrypt failed]");
+            notes.add("Failed to decrypt field: " + field);
+        }
     }
 
-  const digestHash = await crypto.subtle.digest('SHA-256', bodyBytes);
-  const digestB64 = bytesToB64(digestHash);
-  const created = Math.floor(Date.now() / 1000);
+    private static String headerFirst(HttpExchange ex, String name) {
+        List<String> v = ex.getRequestHeaders().get(name);
+        return (v == null || v.isEmpty()) ? null : v.get(0);
+    }
 
-  const base =
-    `"@method": "${String(method).toLowerCase()}"\n` +
-    `"@target-uri": "${targetUri}"\n` +
-    `"x-req-created": ${created}\n` +
-    `"x-req-content-digest": sha-256=:${digestB64}:\n` +
-    `"x-client-key-id": ${REQ_SIGN_KID}`;
+    private static Map<String, Object> flattenHeaders(Headers h) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> e : h.entrySet()) {
+            if (e.getValue() == null) {
+                continue;
+            }
+            if ("Cookie".equalsIgnoreCase(e.getKey())) {
+                out.put("Cookie", "[redacted]");
+                continue;
+            }
+            out.put(e.getKey(), e.getValue().size() == 1 ? e.getValue().get(0) : e.getValue());
+        }
+        return out;
+    }
 
-  const sigBuf = await crypto.subtle.sign(
-            { name: 'RSA-PSS', saltLength: 32 },
-    REQ_SIGN_KEYPAIR.privateKey,
-            new TextEncoder().encode(base)
-  );
+    private static Map<String, Object> pickInterestingHeaders(HttpExchange ex) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        String[] keys = new String[]{
+                "Host", "Origin", "Referer",
+                "X-forwarded-for", "X-forwarded-proto", "X-forwarded-host", "X-forwarded-server",
+                "Content-type", "Content-length",
+                "X-custom", "X-Enc-X-Custom",
+                "Tailscale-user-name", "Tailscale-user-login",
+                "X-Run-Tag", "X-Req-Seq", "X-Bench-Kind",
+                "X-Client-Key-Id", "X-Req-Created", "X-Req-Content-Digest", "X-Req-Signature"
+        };
+        for (String k : keys) {
+            String v = headerFirst(ex, k);
+            if (v != null) {
+                m.put(k, v);
+            }
+        }
+        return m;
+    }
 
-    headers.set('X-Client-Key-Id', REQ_SIGN_KID);
-    headers.set('X-Req-Created', String(created));
-    headers.set('X-Req-Content-Digest', 'sha-256=:' + digestB64 + ':');
-    headers.set('X-Req-Signature', bytesToB64(sigBuf));
+    private static String getQueryParam(String rawQuery, String key) {
+        if (rawQuery == null) {
+            return null;
+        }
+        for (String part : rawQuery.split("&")) {
+            String[] kv = part.split("=", 2);
+            if (kv.length >= 1 && kv[0].equals(key)) {
+                return kv.length == 2 ? urlDecode(kv[1]) : "";
+            }
+        }
+        return null;
+    }
+
+    private static String urlDecode(String s) {
+        try {
+            return URLDecoder.decode(s, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return s;
+        }
+    }
+
+    private static String stringValue(Object v) {
+        return v == null ? null : String.valueOf(v);
+    }
+
+    private static void logReqSigningHeaders(HttpExchange ex, String endpoint) {
+        System.out.println("---- REQUEST SIGN HEADERS [" + endpoint + "] ----");
+        System.out.println("method = " + ex.getRequestMethod());
+        System.out.println("path   = " + ex.getRequestURI());
+
+        System.out.println("X-Client-Key-Id      = " + headerFirst(ex, "X-Client-Key-Id"));
+        System.out.println("X-Req-Created        = " + headerFirst(ex, "X-Req-Created"));
+        System.out.println("X-Req-Content-Digest = " + headerFirst(ex, "X-Req-Content-Digest"));
+
+        String sig = headerFirst(ex, "X-Req-Signature");
+        if (sig == null) {
+            System.out.println("X-Req-Signature      = null");
+        } else {
+            String shortSig = sig.length() <= 80
+                    ? sig
+                    : sig.substring(0, 40) + " ... " + sig.substring(sig.length() - 24);
+            System.out.println("X-Req-Signature      = " + shortSig + " (len=" + sig.length() + ")");
+        }
+
+        System.out.println("----------------------------------------------");
+    }
+
+    static class HandlerResult {
+        int status;
+        String contentType;
+        byte[] body;
+
+        static HandlerResult json(String body) {
+            return new HandlerResult(200, "application/json; charset=utf-8", body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        static HandlerResult text(int status, String msg) {
+            return new HandlerResult(status, "text/plain; charset=utf-8", msg.getBytes(StandardCharsets.UTF_8));
+        }
+
+        static HandlerResult bytes(int status, String ct, byte[] b) {
+            return new HandlerResult(status, ct, b);
+        }
+
+        static HandlerResult error(String msg) {
+            return json("{\"error\":\"" + Server.json(msg) + "\"}");
+        }
+
+        HandlerResult(int status, String contentType, byte[] body) {
+            this.status = status;
+            this.contentType = contentType;
+            this.body = body;
+        }
+    }
 }
-
-function applyRequestDigestTamper(headers) {
-    headers.set('X-Req-Content-Digest', 'sha-256=:' + bytesToB64(new Uint8Array(32)) + ':');
-}
-
-self.addEventListener('fetch', event => {
-  const url = new URL(event.request.url);
-
-    if (!url.protocol.startsWith('http')) return;
-    if (url.origin !== self.location.origin) return;
-    if (BOOTSTRAP_PATHS.has(url.pathname)) return;
-
-    event.respondWith((async () => {
-    const demo = getDemoForApi(url);
-
-    if (shouldBypassSecurity(url)) {
-      const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
-
-      const init = {
-                method: event.request.method,
-                redirect: 'follow',
-                credentials: 'omit',
-                headers: new Headers()
-      };
-
-      const contentType = event.request.headers.get('Content-Type');
-        if (contentType) {
-            init.headers.set('Content-Type', contentType);
-        }
-
-        if (event.request.method !== 'GET' && event.request.method !== 'HEAD') {
-            init.body = await event.request.clone().arrayBuffer();
-            if (!init.headers.has('Content-Type')) {
-                init.headers.set('Content-Type', 'application/octet-stream');
-            }
-        }
-
-      const res = await fetch(upstreamUrl, init);
-        log('BYPASS ' + url.pathname + ' → ' + res.status);
-        return res;
-    }
-
-    if (!SIG_VERIFY_KEY) {
-      const res = await fetch(event.request);
-        log('PASS (no key yet) ' + url.pathname + ' → ' + res.status);
-        return res;
-    }
-
-    const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
-
-    const init = {
-            method: event.request.method,
-            redirect: 'follow',
-            credentials: 'omit',
-            headers: new Headers()
-    };
-
-    const contentType = event.request.headers.get('Content-Type');
-    if (contentType) {
-        init.headers.set('Content-Type', contentType);
-    }
-
-    let requestBodyBytes = new ArrayBuffer(0);
-    if (event.request.method !== 'GET' && event.request.method !== 'HEAD') {
-        requestBodyBytes = await event.request.clone().arrayBuffer();
-        init.body = requestBodyBytes;
-        if (!init.headers.has('Content-Type')) {
-            init.headers.set('Content-Type', 'application/octet-stream');
-        }
-    }
-
-    if (shouldSignRequest(url, event.request.method)) {
-        await ensureProtectedFlowReady();
-      const targetUri = url.pathname + url.search;
-        await addRequestSignature(init.headers, event.request.method, targetUri, requestBodyBytes);
-
-        if (demo === 'req-bad-digest') {
-            applyRequestDigestTamper(init.headers);
-            log('request demo active: wrong request digest');
-        }
-    }
-
-    let res;
-    try {
-        res = await fetch(upstreamUrl, init);
-    } catch (e) {
-        log('NETWORK ERROR ' + url.pathname + ' ' + (e?.message || String(e)));
-        throw e;
-    }
-
-    const ct = res.headers.get('Content-Type') || '';
-    if (!isProtectedContentType(ct)) {
-        log('PASS (unverified type) ' + url.pathname + ' ct=' + ct + ' → ' + res.status);
-        return res;
-    }
-
-    const bodyBytes = await res.clone().arrayBuffer();
-
-    try {
-      const method = event.request.method;
-      const targetUri = url.pathname + url.search;
-        await verifyResponse(res, bodyBytes, method, targetUri);
-
-      const outHeaders = new Headers(res.headers);
-        outHeaders.delete('content-length');
-
-        return new Response(bodyBytes, {
-                status: res.status,
-                statusText: res.statusText,
-                headers: outHeaders
-      });
-    } catch (e) {
-        log('BLOCK ' + url.pathname + ' reason=' + (e?.message || String(e)) + ' ct=' + ct + ' status=' + res.status);
-
-        return new Response(
-                'Blocked by Service Worker (integrity violation): ' + (e?.message || 'unknown'),
-        { status: 498, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
-      );
-    }
-  })());
-});
