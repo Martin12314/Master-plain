@@ -40,13 +40,14 @@
     <a href="/index.html?tamper=signature">signature</a> ·
     <a href="/index.html?tamper=digest">digest</a> ·
     <a href="/index.html?tamper=body">body</a> ·
-    <a href="/index.html?tamper=all">all</a>
+    <a href="/index.html?tamper=all">all</a> ·
+    <a href="/index.html?tamper=req-key-receipt">req-key-receipt</a>
 </p>
 
 <fieldset>
     <legend>Body</legend>
-    <label>Name <input id="name" placeholder="martin"></label>
-    <label>Age <input id="age" type="number" value="25"></label>
+    <label>Name <input id="name" placeholder="alice"></label>
+    <label>Age <input id="age" type="number" value="30"></label>
     <label>Message <textarea id="msg" rows="3" placeholder="hello"></textarea></label>
     <label><input type="checkbox" id="encName" checked> Encrypt name</label>
     <label><input type="checkbox" id="encMsg" checked> Encrypt message</label>
@@ -168,6 +169,14 @@
       );
 
       const rs = await getReqSignStatus();
+      async function setSwBootstrapTamper() {
+      const active = await swActive();
+      if (!active) throw new Error('No active Service Worker instance');
+
+      const tamper = new URLSearchParams(location.search).get('tamper') || '';
+      active.postMessage({ type: 'SET_BOOTSTRAP_TAMPER', tamper });
+      pageLog('Bootstrap tamper mode sent to SW:', tamper || 'none');
+    }
       reqSignOK = !!rs.ready;
       pageLog('Request-sign status from SW: ready=', String(reqSignOK), 'kid=', rs.kid || '(none)');
 
@@ -196,6 +205,7 @@
     }
 
     initKey().catch(err => {
+      await setSwBootstrapTamper();
       badge(false, 'Key exchange error: ' + err.message);
       pageLog('Key exchange error:', err.message);
       console.error(err);
