@@ -1,4 +1,15 @@
 // src/main/java/Server.java
+import com.authlete.hms.ComponentIdentifier;
+import com.authlete.hms.ComponentIdentifierParameters;
+import com.authlete.hms.ComponentValueProvider;
+import com.authlete.hms.HttpSigner;
+import com.authlete.hms.HttpVerifier;
+import com.authlete.hms.SignatureBase;
+import com.authlete.hms.SignatureBaseBuilder;
+import com.authlete.hms.SignatureField;
+import com.authlete.hms.SignatureInputField;
+import com.authlete.hms.SignatureMetadata;
+import com.authlete.hms.SignatureMetadataParameters;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.Filter;
@@ -26,10 +37,12 @@ import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.Signature;
+import java.security.SignatureException;
 import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.PSSParameterSpec;
+import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -56,6 +69,27 @@ public class Server {
     private static RSAPublicKey SIG_PUB;
     private static RSAPrivateKey SIG_PRIV;
 
+    private static final String APP_ORIGIN = "https://app.masteroppgave2026.no";
+    private static final String HOST_SIG_KID = "sig-key-1";
+    private static final String HTTP_SIG_ALG = "rsa-pss-sha512";
+
+    private static final List<ComponentIdentifier> REQ_COMPONENTS = List.of(
+            cid("@method"),
+            cid("@target-uri"),
+            cid("content-digest")
+    );
+
+    private static final List<ComponentIdentifier> RESP_COMPONENTS = List.of(
+            cidReq("@method"),
+            cidReq("@target-uri"),
+            cid("@status"),
+            cid("content-digest")
+    );
+
+    private static String publicTargetUri(HttpExchange ex) {
+        return APP_ORIGIN + ex.getRequestURI().toString();
+    }
+
     public static void main(String[] args) throws Exception {
         rotateJweKeypair();
 
@@ -67,6 +101,7 @@ public class Server {
         System.out.println("== Host starting ==");
         System.out.println("JWE key: " + JWE_KID);
         System.out.println("SIG key: " + sigJwk.getKeyId());
+        System.out.println("HTTP Message Signature alg: " + HTTP_SIG_ALG);
 
         HttpServer http = HttpServer.create(new InetSocketAddress("0.0.0.0", 8080), 0);
         List<HttpContext> contexts = new ArrayList<>();
@@ -134,9 +169,9 @@ public class Server {
             String json =
                     "{"
                             + "\"kty\":\"RSA\","
-                            + "\"kid\":\"sig-key-1\","
+                            + "\"kid\":\"" + HOST_SIG_KID + "\","
                             + "\"use\":\"sig\","
-                            + "\"alg\":\"PS256\","
+                            + "\"alg\":\"PS512\","
                             + "\"created\":" + now + ","
                             + "\"expires\":" + exp + ","
                             + "\"n\":\"" + n + "\","
@@ -235,35 +270,14 @@ public class Server {
 
     private static boolean verifyClientSignedRequest(HttpExchange ex, byte[] bodyBytes) {
         try {
-            String kid = headerFirst(ex, "X-Client-Key-Id");
-            String created = headerFirst(ex, "X-Req-Created");
-            String cd = headerFirst(ex, "X-Req-Content-Digest");
-            String sigB64 = headerFirst(ex, "X-Req-Signature");
+            String cd = headerFirst(ex, "Content-Digest");
+            String sigInputHeader = headerFirst(ex, "Signature-Input");
+            String sigHeader = headerFirst(ex, "Signature");
 
             System.out.println("[REQ-VERIFY] endpoint=" + ex.getRequestURI());
 
-            if (kid == null || created == null || cd == null || sigB64 == null) {
-                System.out.println("[REQ-VERIFY] FAIL missing signing headers");
-                return false;
-            }
-
-            long createdSec;
-            try {
-                createdSec = Long.parseLong(created);
-            } catch (Exception e) {
-                System.out.println("[REQ-VERIFY] FAIL bad X-Req-Created");
-                return false;
-            }
-
-            long nowSec = System.currentTimeMillis() / 1000L;
-            if (Math.abs(nowSec - createdSec) > 300) {
-                System.out.println("[REQ-VERIFY] FAIL X-Req-Created outside allowed window");
-                return false;
-            }
-
-            RSAPublicKey pub = CLIENT_REQ_PUBS.get(kid);
-            if (pub == null) {
-                System.out.println("[REQ-VERIFY] FAIL unknown client key id: " + kid);
+            if (cd == null || sigInputHeader == null || sigHeader == null) {
+                System.out.println("[REQ-VERIFY] FAIL missing Content-Digest / Signature-Input / Signature");
                 return false;
             }
 
@@ -277,60 +291,69 @@ public class Server {
                 return false;
             }
 
-            String method = ex.getRequestMethod().toLowerCase(Locale.ROOT);
-            String target = ex.getRequestURI().toString();
+            SignatureInputField inputField = SignatureInputField.parse(sigInputHeader);
+            SignatureField signatureField = SignatureField.parse(sigHeader);
 
-            String base =
-                    "\"@method\": \"" + method + "\"\n"
-                            + "\"@target-uri\": \"" + target + "\"\n"
-                            + "\"x-req-created\": " + created + "\n"
-                            + "\"x-req-content-digest\": " + cd + "\n"
-                            + "\"x-client-key-id\": " + kid;
+            SignatureMetadata metadata = inputField == null ? null : inputField.get("req");
+            byte[] signature = signatureField == null ? null : signatureField.get("req");
 
-            Signature s = Signature.getInstance("RSASSA-PSS");
-            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
-            s.initVerify(pub);
-            s.update(base.getBytes(StandardCharsets.UTF_8));
+            if (metadata == null || signature == null) {
+                System.out.println("[REQ-VERIFY] FAIL missing req signature label");
+                return false;
+            }
 
-            boolean ok = s.verify(Base64.getDecoder().decode(sigB64));
+            if (!REQ_COMPONENTS.equals(metadata)) {
+                System.out.println("[REQ-VERIFY] FAIL unexpected covered components: " + metadata.serialize());
+                return false;
+            }
+
+            SignatureMetadataParameters params = metadata.getParameters();
+            String alg = params.getAlg();
+            String keyId = params.getKeyid();
+            Instant created = params.getCreated();
+
+            if (!HTTP_SIG_ALG.equalsIgnoreCase(alg)) {
+                System.out.println("[REQ-VERIFY] FAIL unsupported alg: " + alg);
+                return false;
+            }
+
+            if (keyId == null || keyId.isBlank()) {
+                System.out.println("[REQ-VERIFY] FAIL missing keyid");
+                return false;
+            }
+
+            if (created == null) {
+                System.out.println("[REQ-VERIFY] FAIL missing created");
+                return false;
+            }
+
+            long createdSec = created.getEpochSecond();
+            long nowSec = System.currentTimeMillis() / 1000L;
+
+            if (Math.abs(nowSec - createdSec) > 300) {
+                System.out.println("[REQ-VERIFY] FAIL Signature-Input created outside allowed window");
+                return false;
+            }
+
+            RSAPublicKey pub = CLIENT_REQ_PUBS.get(keyId);
+            if (pub == null) {
+                System.out.println("[REQ-VERIFY] FAIL unknown client key id: " + keyId);
+                return false;
+            }
+
+            ComponentValueProvider provider = requestComponentProvider(ex);
+            SignatureBase base = new SignatureBaseBuilder(provider).build(metadata);
+
+            boolean ok = base.verify(httpVerifierPssSha512(pub), signature);
 
             System.out.println("[REQ-VERIFY] signature base:");
-            System.out.println(base);
+            System.out.println(base.serialize());
             System.out.println("[REQ-VERIFY] signature valid = " + ok);
-
-            if (!ok) {
-                System.out.println("[REQ-VERIFY] FAIL request signature verification failed");
-            } else {
-                System.out.println("[REQ-VERIFY] OK");
-            }
 
             return ok;
         } catch (Exception e) {
             System.out.println("[REQ-VERIFY] FAIL exception: " + e.getMessage());
             return false;
-        }
-    }
-
-    private static void handleLoginPlain(HttpExchange ex) {
-        try {
-            ex.setAttribute("disableSigning", Boolean.TRUE);
-
-            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
-                ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
-                return;
-            }
-
-            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-            Map<String, Object> bodyMap = tryParseJsonMap(body);
-
-            String user = bodyMap.getOrDefault("username", "").toString();
-            String pass = bodyMap.getOrDefault("password", "").toString();
-
-            boolean success = "alice".equals(user) && "secret".equals(pass);
-            String respJson = success ? "{\"ok\":true}" : "{\"ok\":false}";
-            ex.setAttribute("handlerResult", HandlerResult.json(respJson));
-        } catch (Exception e) {
-            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
         }
     }
 
@@ -460,7 +483,7 @@ public class Server {
     static class ResponseSignerFilter extends Filter {
         @Override
         public String description() {
-            return "Signs responses";
+            return "Signs responses with RFC 9421 HTTP Message Signatures";
         }
 
         @Override
@@ -499,32 +522,8 @@ public class Server {
             int status = result.status;
 
             String correctDigest = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(sendBody)) + ":";
-            long created = System.currentTimeMillis() / 1000L;
-            String method = ex.getRequestMethod().toLowerCase(Locale.ROOT);
-            String target = ex.getRequestURI().toString();
-
-            String sigInput =
-                    "(\"@method\" \"@target-uri\" \"@status\" \"content-digest\");"
-                            + "created=" + created + ";"
-                            + "keyid=\"sig-key-1\";"
-                            + "alg=\"rsa-pss-sha256\"";
-
-            String base =
-                    "\"@method\": \"" + method + "\"\n"
-                            + "\"@target-uri\": \"" + target + "\"\n"
-                            + "\"@status\": " + status + "\n"
-                            + "content-digest: " + correctDigest + "\n"
-                            + "\"@signature-params\": " + sigInput;
-
-            String sigB64;
-            try {
-                byte[] sig = signPss(base.getBytes(StandardCharsets.US_ASCII), SIG_PRIV);
-                sigB64 = Base64.getEncoder().encodeToString(sig);
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-
             String sendDigest = correctDigest;
+
             if ("resp-bad-digest".equals(demo)) {
                 sendDigest = "sha-256=:" + Base64.getEncoder().encodeToString(new byte[32]) + ":";
                 System.out.println("[RESP-SEND] demo wrong response digest active");
@@ -537,8 +536,28 @@ public class Server {
             h.set("Content-Type", result.contentType);
             h.set("Connection", "close");
             h.set("Content-Digest", sendDigest);
-            h.set("Signature-Input", "sig1=" + sigInput);
-            h.set("Signature", "sig1=:" + sigB64 + ":");
+
+            try {
+                long created = System.currentTimeMillis() / 1000L;
+                SignatureMetadata metadata = responseSignatureMetadata(created);
+                ComponentValueProvider provider = responseComponentProvider(ex, h, status);
+                SignatureBase base = new SignatureBaseBuilder(provider).build(metadata);
+                byte[] sig = base.sign(httpSignerPssSha512(SIG_PRIV));
+
+                SignatureInputField sigInput = new SignatureInputField();
+                sigInput.put("sig1", metadata);
+
+                SignatureField sigField = new SignatureField();
+                sigField.put("sig1", sig);
+
+                h.set("Signature-Input", sigInput.serialize());
+                h.set("Signature", sigField.serialize());
+
+                System.out.println("[RESP-SEND] signature base:");
+                System.out.println(base.serialize());
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
 
             ex.sendResponseHeaders(status, sendBody.length);
             try (OutputStream os = ex.getResponseBody()) {
@@ -616,6 +635,104 @@ public class Server {
         return null;
     }
 
+    private static ComponentIdentifier cid(String name) {
+        return new ComponentIdentifier(name);
+    }
+
+    private static ComponentIdentifier cidReq(String name) {
+        ComponentIdentifierParameters params = new ComponentIdentifierParameters()
+                .setReq(true);
+        return new ComponentIdentifier(name, params);
+    }
+
+    private static SignatureMetadata requestSignatureMetadata(String keyId, long created) {
+        SignatureMetadataParameters params = new SignatureMetadataParameters()
+                .setCreated(created)
+                .setKeyid(keyId)
+                .setAlg(HTTP_SIG_ALG);
+
+        return new SignatureMetadata(REQ_COMPONENTS, params);
+    }
+
+    private static SignatureMetadata responseSignatureMetadata(long created) {
+        SignatureMetadataParameters params = new SignatureMetadataParameters()
+                .setCreated(created)
+                .setKeyid(HOST_SIG_KID)
+                .setAlg(HTTP_SIG_ALG);
+
+        return new SignatureMetadata(RESP_COMPONENTS, params);
+    }
+
+    private static Map<String, List<String>> headerMap(Headers headers) {
+        Map<String, List<String>> out = new LinkedHashMap<>();
+
+        for (Map.Entry<String, List<String>> e : headers.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) {
+                continue;
+            }
+
+            out.put(e.getKey().toLowerCase(Locale.ROOT), e.getValue());
+        }
+
+        return out;
+    }
+
+    private static ComponentValueProvider requestComponentProvider(HttpExchange ex) {
+        return new ComponentValueProvider()
+                .setMethod(ex.getRequestMethod().toUpperCase(Locale.ROOT))
+                .setTargetUri(publicTargetUri(ex))
+                .setHeaders(headerMap(ex.getRequestHeaders()));
+    }
+
+    private static ComponentValueProvider responseComponentProvider(HttpExchange ex, Headers responseHeaders, int status) {
+        return new ComponentValueProvider()
+                .setMethod(ex.getRequestMethod().toUpperCase(Locale.ROOT))
+                .setTargetUri(publicTargetUri(ex))
+                .setStatus(status)
+                .setHeaders(headerMap(responseHeaders))
+                .setHeadersInRequest(headerMap(ex.getRequestHeaders()));
+    }
+
+    private static HttpSigner httpSignerPssSha512(RSAPrivateKey key) {
+        return signatureBase -> {
+            try {
+                return signPssSha512(signatureBase, key);
+            } catch (Exception e) {
+                SignatureException se = new SignatureException("RSA-PSS-SHA512 signing failed");
+                se.initCause(e);
+                throw se;
+            }
+        };
+    }
+
+    private static HttpVerifier httpVerifierPssSha512(RSAPublicKey key) {
+        return (signatureBase, signature) -> {
+            try {
+                return verifyPssSha512(signatureBase, signature, key);
+            } catch (Exception e) {
+                SignatureException se = new SignatureException("RSA-PSS-SHA512 verification failed");
+                se.initCause(e);
+                throw se;
+            }
+        };
+    }
+
+    private static byte[] signPssSha512(byte[] input, PrivateKey key) throws Exception {
+        Signature s = Signature.getInstance("RSASSA-PSS");
+        s.setParameter(new PSSParameterSpec("SHA-512", "MGF1", MGF1ParameterSpec.SHA512, 64, 1));
+        s.initSign(key);
+        s.update(input);
+        return s.sign();
+    }
+
+    private static boolean verifyPssSha512(byte[] input, byte[] signature, RSAPublicKey key) throws Exception {
+        Signature s = Signature.getInstance("RSASSA-PSS");
+        s.setParameter(new PSSParameterSpec("SHA-512", "MGF1", MGF1ParameterSpec.SHA512, 64, 1));
+        s.initVerify(key);
+        s.update(input);
+        return s.verify(signature);
+    }
+
     private static void rotateJweKeypair() throws Exception {
         RsaJsonWebKey j = RsaJwkGenerator.generateJwk(2048);
         JWE_PUB = (RSAPublicKey) j.getPublicKey();
@@ -651,14 +768,6 @@ public class Server {
         }
     }
 
-    private static byte[] signPss(byte[] input, PrivateKey key) throws Exception {
-        Signature s = Signature.getInstance("RSASSA-PSS");
-        s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
-        s.initSign(key);
-        s.update(input);
-        return s.sign();
-    }
-
     private static String b64urlUnsigned(byte[] in) {
         if (in.length > 1 && in[0] == 0) {
             in = Arrays.copyOfRange(in, 1, in.length);
@@ -687,7 +796,7 @@ public class Server {
     private static boolean verifyReqKeyRegistrationProof(RSAPublicKey pub, String proofBase, String proofB64) {
         try {
             Signature s = Signature.getInstance("RSASSA-PSS");
-            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.setParameter(new PSSParameterSpec("SHA-512", "MGF1", MGF1ParameterSpec.SHA512, 64, 1));
             s.initVerify(pub);
             s.update(proofBase.getBytes(StandardCharsets.UTF_8));
             return s.verify(Base64.getDecoder().decode(proofB64));
@@ -846,7 +955,7 @@ public class Server {
                 "X-custom", "X-Enc-X-Custom",
                 "Tailscale-user-name", "Tailscale-user-login",
                 "X-Run-Tag", "X-Req-Seq", "X-Bench-Kind",
-                "X-Client-Key-Id", "X-Req-Created", "X-Req-Content-Digest", "X-Req-Signature"
+                "Content-Digest", "Signature-Input", "Signature"
         };
         for (String k : keys) {
             String v = headerFirst(ex, k);
@@ -887,18 +996,17 @@ public class Server {
         System.out.println("method = " + ex.getRequestMethod());
         System.out.println("path   = " + ex.getRequestURI());
 
-        System.out.println("X-Client-Key-Id      = " + headerFirst(ex, "X-Client-Key-Id"));
-        System.out.println("X-Req-Created        = " + headerFirst(ex, "X-Req-Created"));
-        System.out.println("X-Req-Content-Digest = " + headerFirst(ex, "X-Req-Content-Digest"));
+        System.out.println("Content-Digest  = " + headerFirst(ex, "Content-Digest"));
+        System.out.println("Signature-Input = " + headerFirst(ex, "Signature-Input"));
 
-        String sig = headerFirst(ex, "X-Req-Signature");
+        String sig = headerFirst(ex, "Signature");
         if (sig == null) {
-            System.out.println("X-Req-Signature      = null");
+            System.out.println("Signature       = null");
         } else {
             String shortSig = sig.length() <= 80
                     ? sig
                     : sig.substring(0, 40) + " ... " + sig.substring(sig.length() - 24);
-            System.out.println("X-Req-Signature      = " + shortSig + " (len=" + sig.length() + ")");
+            System.out.println("Signature       = " + shortSig + " (len=" + sig.length() + ")");
         }
 
         System.out.println("----------------------------------------------");

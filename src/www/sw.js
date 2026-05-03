@@ -1,4 +1,3 @@
-// www/sw.js
 let SIG_VERIFY_KEY = null;
 let SIG_VERIFY_KID = null;
 
@@ -12,6 +11,13 @@ let HOST_JWE_KID = null;
 let PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
 
 const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+const HTTP_SIG_ALG = 'rsa-pss-sha512';
+const JWK_SIG_ALG = 'PS512';
+const PSS_SALT_LENGTH = 64;
+
+function signatureTargetUri(pathAndQuery) {
+  return APP_ORIGIN + pathAndQuery;
+}
 
 const BOOTSTRAP_PATHS = new Set([
   '/sw.js',
@@ -97,9 +103,42 @@ function parseDigestHeader(cd) {
   return m ? m[1] : null;
 }
 
-function parseSigHeader(sig) {
-  const m = sig?.match(/sig1=:(.+):/i);
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseSigHeader(sig, label = 'sig1') {
+  const re = new RegExp('(?:^|,)\\s*' + escapeRegExp(label) + '=:([^:]+):', 'i');
+  const m = sig?.match(re);
   return m ? m[1] : null;
+}
+
+function extractSignatureInputParams(signatureInput, label = 'sig1') {
+  const re = new RegExp('(?:^|,)\\s*' + escapeRegExp(label) + '=(.+)$', 'i');
+  const m = signatureInput?.match(re);
+  return m ? m[1].trim() : null;
+}
+
+function requireResponseSignatureProfile(signatureInput) {
+  if (!signatureInput.includes('alg="' + HTTP_SIG_ALG + '"')) {
+    throw new Error('unexpected response signature alg');
+  }
+
+  if (!signatureInput.includes('keyid="sig-key-1"')) {
+    throw new Error('unexpected response signature keyid');
+  }
+
+  const createdMatch = signatureInput.match(/(?:^|;)created=(\d+)/);
+  if (!createdMatch) {
+    throw new Error('missing response signature created');
+  }
+
+  const created = Number(createdMatch[1]);
+  const now = Math.floor(Date.now() / 1000);
+
+  if (!Number.isFinite(created) || Math.abs(now - created) > 300) {
+    throw new Error('response signature created outside allowed window');
+  }
 }
 
 function isProtectedContentType(ct) {
@@ -130,12 +169,16 @@ function buildResponseSignatureBase(response, method, targetUri) {
     return null;
   }
 
-  const params = sigInput.replace(/^sig1=/, '');
+  const params = extractSignatureInputParams(sigInput, 'sig1');
+  if (!params) {
+    return null;
+  }
+
   return (
-    `"@method": "${String(method).toLowerCase()}"\n` +
-    `"@target-uri": "${targetUri}"\n` +
+    `"@method";req: ${String(method).toUpperCase()}\n` +
+    `"@target-uri";req: ${targetUri}\n` +
     `"@status": ${response.status}\n` +
-    `content-digest: ${cd}\n` +
+    `"content-digest": ${cd}\n` +
     `"@signature-params": ${params}`
   );
 }
@@ -166,6 +209,13 @@ async function buildResponseVerifyLog(response, bodyBytes, method, targetUri) {
     return info;
   }
 
+  try {
+    requireResponseSignatureProfile(signatureInput);
+  } catch (e) {
+    info.error = e.message || String(e);
+    return info;
+  }
+
   const digestB64 = parseDigestHeader(contentDigest);
   if (!digestB64) {
     info.error = 'bad Content-Digest format';
@@ -177,18 +227,18 @@ async function buildResponseVerifyLog(response, bodyBytes, method, targetUri) {
     return info;
   }
 
-  const sigB64 = parseSigHeader(signature);
+  const sigB64 = parseSigHeader(signature, 'sig1');
   if (!sigB64) {
     info.error = 'bad Signature format';
     return info;
   }
 
-  const ok = await crypto.subtle.verify(
-    { name: 'RSA-PSS', saltLength: 32 },
-    SIG_VERIFY_KEY,
-    b64ToBytes(sigB64),
-    new TextEncoder().encode(signatureBase)
-  );
+    const ok = await crypto.subtle.verify(
+      { name: 'RSA-PSS', saltLength: PSS_SALT_LENGTH },
+      SIG_VERIFY_KEY,
+      b64ToBytes(sigB64),
+      new TextEncoder().encode(signatureBase)
+    );
 
   info.signatureValid = ok;
   if (!ok) {
@@ -226,7 +276,7 @@ async function fetchVerifiedJson(method, targetUri, init = {}) {
   });
 
   const bodyBytes = await r.clone().arrayBuffer();
-  await verifyResponse(r, bodyBytes, method, targetUri);
+  await verifyResponse(r, bodyBytes, method, signatureTargetUri(targetUri));
 
   if (!r.ok) {
     throw new Error(`${targetUri} failed HTTP ${r.status}`);
@@ -263,7 +313,7 @@ function buildReqKeyRegistrationProofBase(kid, thumbprint) {
 async function generateReqSigningKeypair() {
   if (REQ_SIGN_KEYPAIR) {
     const jwk = await crypto.subtle.exportKey('jwk', REQ_SIGN_KEYPAIR.publicKey);
-    jwk.alg = 'PS256';
+    jwk.alg = JWK_SIG_ALG;
     jwk.use = 'sig';
     jwk.kid = REQ_SIGN_KID;
 
@@ -282,14 +332,14 @@ async function generateReqSigningKeypair() {
       name: 'RSA-PSS',
       modulusLength: 2048,
       publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256'
+      hash: 'SHA-512'
     },
     true,
     ['sign', 'verify']
   );
 
   const jwk = await crypto.subtle.exportKey('jwk', REQ_SIGN_KEYPAIR.publicKey);
-  jwk.alg = 'PS256';
+  jwk.alg = JWK_SIG_ALG;
   jwk.use = 'sig';
   jwk.kid = REQ_SIGN_KID;
 
@@ -309,14 +359,14 @@ async function generateEphemeralReqSigningKeypair() {
       name: 'RSA-PSS',
       modulusLength: 2048,
       publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256'
+      hash: 'SHA-512'
     },
     true,
     ['sign', 'verify']
   );
 
   const jwk = await crypto.subtle.exportKey('jwk', keypair.publicKey);
-  jwk.alg = 'PS256';
+  jwk.alg = JWK_SIG_ALG;
   jwk.use = 'sig';
   jwk.kid = kid;
 
@@ -349,7 +399,7 @@ async function fetchVerifiedHostJweJwk() {
   }
 
   const bodyBytes = await r.clone().arrayBuffer();
-  await verifyResponse(r, bodyBytes, 'GET', targetUri);
+  await verifyResponse(r, bodyBytes, 'GET', signatureTargetUri(targetUri));
 
   const jwk = JSON.parse(new TextDecoder().decode(bodyBytes));
   if (!jwk || !jwk.n || !jwk.e) {
@@ -373,9 +423,9 @@ async function registerReqSigningKeyWithServer(demo = '', ephemeral = false) {
   const proofBase = buildReqKeyRegistrationProofBase(material.kid, thumbprint);
 
   const proofBuf = await crypto.subtle.sign(
-    { name: 'RSA-PSS', saltLength: 32 },
-    material.privateKey,
-    new TextEncoder().encode(proofBase)
+      { name: 'RSA-PSS', saltLength: PSS_SALT_LENGTH },
+      material.privateKey,
+      new TextEncoder().encode(proofBase)
   );
 
   const targetUri = demo
@@ -480,7 +530,7 @@ self.addEventListener('message', async event => {
       SIG_VERIFY_KEY = await crypto.subtle.importKey(
         'jwk',
         event.data.jwk,
-        { name: 'RSA-PSS', hash: 'SHA-256' },
+        { name: 'RSA-PSS', hash: 'SHA-512' },
         false,
         ['verify']
       );
@@ -586,36 +636,49 @@ self.addEventListener('message', async event => {
   }
 });
 
+
+
 async function addRequestSignature(headers, method, targetUri, bodyBytes) {
   if (!REQ_SIGN_KEYPAIR || !REQ_SIGN_KID || !REQ_SIGN_READY) {
     throw new Error('request-signing key not ready');
   }
 
-  const digestHash = await crypto.subtle.digest('SHA-256', bodyBytes);
-  const digestB64 = bytesToB64(digestHash);
+  const contentDigest = await computeDigestHeader(bodyBytes);
   const created = Math.floor(Date.now() / 1000);
 
-  const base =
-    `"@method": "${String(method).toLowerCase()}"\n` +
-    `"@target-uri": "${targetUri}"\n` +
-    `"x-req-created": ${created}\n` +
-    `"x-req-content-digest": sha-256=:${digestB64}:\n` +
-    `"x-client-key-id": ${REQ_SIGN_KID}`;
+  const sigInput =
+    '("@method" "@target-uri" "content-digest");' +
+    'created=' + created + ';' +
+    'keyid="' + REQ_SIGN_KID + '";' +
+    'alg="' + HTTP_SIG_ALG + '"';
+
+  const signatureBase =
+    `"@method": ${String(method).toUpperCase()}\n` +
+    `"@target-uri": ${targetUri}\n` +
+    `"content-digest": ${contentDigest}\n` +
+    `"@signature-params": ${sigInput}`;
 
   const sigBuf = await crypto.subtle.sign(
-    { name: 'RSA-PSS', saltLength: 32 },
+    { name: 'RSA-PSS', saltLength: PSS_SALT_LENGTH },
     REQ_SIGN_KEYPAIR.privateKey,
-    new TextEncoder().encode(base)
+    new TextEncoder().encode(signatureBase)
   );
 
-  headers.set('X-Client-Key-Id', REQ_SIGN_KID);
-  headers.set('X-Req-Created', String(created));
-  headers.set('X-Req-Content-Digest', 'sha-256=:' + digestB64 + ':');
-  headers.set('X-Req-Signature', bytesToB64(sigBuf));
+  headers.set('Content-Digest', contentDigest);
+  headers.set('Signature-Input', 'req=' + sigInput);
+  headers.set('Signature', 'req=:' + bytesToB64(sigBuf) + ':');
+
+  logJson('Request signature created', {
+    targetUri,
+    method: String(method).toUpperCase(),
+    contentDigest,
+    signatureInput: 'req=' + sigInput,
+    signatureBase
+  });
 }
 
 function applyRequestDigestTamper(headers) {
-  headers.set('X-Req-Content-Digest', 'sha-256=:' + bytesToB64(new Uint8Array(32)) + ':');
+  headers.set('Content-Digest', 'sha-256=:' + bytesToB64(new Uint8Array(32)) + ':');
 }
 
 self.addEventListener('fetch', event => {
@@ -686,8 +749,16 @@ self.addEventListener('fetch', event => {
 
     if (shouldSignRequest(url, event.request.method)) {
       await ensureProtectedFlowReady();
-      const targetUri = url.pathname + url.search;
-      await addRequestSignature(init.headers, event.request.method, targetUri, requestBodyBytes);
+
+      const targetPath = url.pathname + url.search;
+      const targetUri = signatureTargetUri(targetPath);
+
+      await addRequestSignature(
+        init.headers,
+        event.request.method,
+        targetUri,
+        requestBodyBytes
+      );
 
       if (demo === 'req-bad-digest') {
         applyRequestDigestTamper(init.headers);
@@ -713,7 +784,9 @@ self.addEventListener('fetch', event => {
 
     try {
       const method = event.request.method;
-      const targetUri = url.pathname + url.search;
+      const targetPath = url.pathname + url.search;
+      const targetUri = signatureTargetUri(targetPath);
+
       await verifyResponse(res, bodyBytes, method, targetUri);
 
       const outHeaders = new Headers(res.headers);
