@@ -20,7 +20,9 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
@@ -46,26 +48,32 @@ import java.util.regex.Pattern;
 public class Server {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final Map<String, RSAPublicKey> CLIENT_REQ_PUBS = new ConcurrentHashMap<>();
+    private static final Path METRICS_DIR = Paths.get("metrics");
+    private static final Path METRICS_FILE = METRICS_DIR.resolve("metrics.ndjson");
 
+    private static final Map<String, RSAPublicKey> CLIENT_REQ_PUBS = new ConcurrentHashMap<>();
     private static RSAPublicKey WRONG_CLIENT_REQ_VERIFY_PUB;
+
     private static RSAPublicKey JWE_PUB;
     private static RSAPrivateKey JWE_PRIV;
+    private static final String JWE_KID = "host-jwe-key-1";
+
+    private static RSAPublicKey SIG_PUB;
     private static RSAPrivateKey SIG_PRIV;
 
-    private static final String JWE_KID = "host-jwe-key-1";
-    private static final String SIG_KID = "sig-key-1";
-
     public static void main(String[] args) throws Exception {
+        Files.createDirectories(METRICS_DIR);
         rotateJweKeypair();
 
         String jwkJson = Files.readString(Paths.get("sig-key.jwk.json"), StandardCharsets.UTF_8);
         RsaJsonWebKey sigJwk = (RsaJsonWebKey) JsonWebKey.Factory.newJwk(jwkJson);
+        SIG_PUB = (RSAPublicKey) sigJwk.getPublicKey();
         SIG_PRIV = (RSAPrivateKey) sigJwk.getPrivateKey();
 
         System.out.println("== Host starting ==");
         System.out.println("JWE key: " + JWE_KID);
         System.out.println("SIG key: " + sigJwk.getKeyId());
+        System.out.println("Metrics file: " + METRICS_FILE.toAbsolutePath());
 
         HttpServer http = HttpServer.create(new InetSocketAddress("0.0.0.0", 8080), 0);
         List<HttpContext> contexts = new ArrayList<>();
@@ -74,19 +82,20 @@ public class Server {
         contexts.add(http.createContext("/login.html", Server::handleFile));
         contexts.add(http.createContext("/index.html", Server::handleFile));
         contexts.add(http.createContext("/styles.css", Server::handleFile));
+        contexts.add(http.createContext("/sig-pub", Server::handleSigPub));
         contexts.add(http.createContext("/key-exchange", Server::handleKeyExchange));
-        contexts.add(http.createContext("/req-key/register", Server::handleReqKeyRegister));
+        contexts.add(http.createContext("/metrics", Server::handleMetrics));
         contexts.add(http.createContext("/api/login", Server::handleLogin));
+        contexts.add(http.createContext("/req-key/register", Server::handleReqKeyRegister));
 
-        HttpContext echoContext = http.createContext("/api/echo", Server::handleEcho);
-        HttpContext securedContext = http.createContext("/secured/index.html", Server::handleFile);
+        HttpContext ctxEcho = http.createContext("/api/echo", Server::handleEcho);
+        HttpContext secured1 = http.createContext("/secured/index.html", Server::handleFile);
 
         SessionFilter sessionFilter = new SessionFilter();
-        echoContext.getFilters().add(sessionFilter);
-        securedContext.getFilters().add(sessionFilter);
+        ctxEcho.getFilters().add(sessionFilter);
+        secured1.getFilters().add(sessionFilter);
 
-        contexts.add(echoContext);
-        contexts.add(securedContext);
+        contexts.addAll(List.of(ctxEcho, secured1));
 
         for (HttpContext ctx : contexts) {
             ctx.getFilters().add(new ResponseSignerFilter());
@@ -110,12 +119,39 @@ public class Server {
                 return;
             }
 
-            if (path.startsWith("/unsigned/")) {
+            if (path.startsWith("/unsigned/") || path.equals("/baseline.html")) {
                 ex.setAttribute("disableSigning", Boolean.TRUE);
             }
 
             byte[] data = Files.readAllBytes(file.toPath());
-            ex.setAttribute("handlerResult", HandlerResult.bytes(200, contentType(path), data));
+            String ct = contentType(path);
+            ex.setAttribute("handlerResult", HandlerResult.bytes(200, ct, data));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
+    private static void handleSigPub(HttpExchange ex) {
+        try {
+            long now = System.currentTimeMillis() / 1000L;
+            long exp = now + 86400;
+
+            String n = b64urlUnsigned(SIG_PUB.getModulus().toByteArray());
+            String e = b64urlUnsigned(SIG_PUB.getPublicExponent().toByteArray());
+
+            String json =
+                    "{"
+                            + "\"kty\":\"RSA\","
+                            + "\"kid\":\"sig-key-1\","
+                            + "\"use\":\"sig\","
+                            + "\"alg\":\"PS256\","
+                            + "\"created\":" + now + ","
+                            + "\"expires\":" + exp + ","
+                            + "\"n\":\"" + n + "\","
+                            + "\"e\":\"" + e + "\""
+                            + "}";
+
+            ex.setAttribute("handlerResult", HandlerResult.json(json));
         } catch (Exception e) {
             ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
         }
@@ -132,6 +168,34 @@ public class Server {
         }
     }
 
+    private static void handleMetrics(HttpExchange ex) {
+        try {
+            ex.setAttribute("disableSigning", Boolean.TRUE);
+            setCorsForMetrics(ex);
+
+            if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.setAttribute("handlerResult", HandlerResult.text(204, ""));
+                return;
+            }
+
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
+                return;
+            }
+
+            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            if (body.isBlank()) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "Empty body"));
+                return;
+            }
+
+            appendNdjson(body);
+            ex.setAttribute("handlerResult", HandlerResult.json("{\"ok\":true}"));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
     private static void handleReqKeyRegister(HttpExchange ex) {
         try {
             if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
@@ -139,8 +203,8 @@ public class Server {
                 return;
             }
 
-            String demo = normalizeDemo(getQueryParam(ex.getRequestURI().getRawQuery(), "demo"));
-            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            byte[] bodyBytes = ex.getRequestBody().readAllBytes();
+            String body = new String(bodyBytes, StandardCharsets.UTF_8);
             Map<String, Object> req = tryParseJsonMap(body);
 
             String kid = stringValue(req.get("kid"));
@@ -160,7 +224,7 @@ public class Server {
             RsaJsonWebKey clientJwk = (RsaJsonWebKey) JsonWebKey.Factory.newJwk(jwkJson);
             RSAPublicKey clientPub = (RSAPublicKey) clientJwk.getPublicKey();
 
-            String computedThumbprint = computeReqSignJwkThumbprint(clientPub);
+            String computedThumbprint = computeReqSignJwkThumbprint(clientJwk);
             if (!computedThumbprint.equals(suppliedThumbprint)) {
                 ex.setAttribute("handlerResult", HandlerResult.text(400, "JWK thumbprint mismatch"));
                 return;
@@ -172,30 +236,23 @@ public class Server {
                 return;
             }
 
-            RSAPublicKey storedPub = clientPub;
-            String acceptedThumbprint = computedThumbprint;
+            CLIENT_REQ_PUBS.put(kid, clientPub);
 
-            if ("host-wrong-client-key".equals(demo)) {
-                storedPub = wrongClientReqVerifyPublicKey();
-                acceptedThumbprint = computeReqSignJwkThumbprint(storedPub);
-
-                System.out.println("[REQ-KEY-REGISTER] DEMO wrong host key active");
-                System.out.println("[REQ-KEY-REGISTER] client kid             = " + kid);
-                System.out.println("[REQ-KEY-REGISTER] client thumbprint      = " + computedThumbprint);
-                System.out.println("[REQ-KEY-REGISTER] host stored thumbprint = " + acceptedThumbprint);
-            } else {
-                System.out.println("[REQ-KEY-REGISTER] normal");
-                System.out.println("[REQ-KEY-REGISTER] client kid          = " + kid);
-                System.out.println("[REQ-KEY-REGISTER] accepted thumbprint = " + acceptedThumbprint);
-            }
-
-            CLIENT_REQ_PUBS.put(kid, storedPub);
+            Map<String, Object> metric = new LinkedHashMap<>();
+            metric.put("event", "req_key_register");
+            metric.put("at", isoNow());
+            metric.put("source", "host");
+            metric.put("kid", kid);
+            metric.put("thumbprint", computedThumbprint);
+            metric.put("req_body_bytes", bodyBytes.length);
+            metric.put("req_header_bytes", approximateRequestHeaderBytes(ex));
+            appendMetric(metric);
 
             String resp =
                     "{"
                             + "\"ok\":true,"
                             + "\"acceptedKid\":\"" + json(kid) + "\","
-                            + "\"acceptedThumbprint\":\"" + json(acceptedThumbprint) + "\""
+                            + "\"acceptedThumbprint\":\"" + json(computedThumbprint) + "\""
                             + "}";
 
             ex.setAttribute("handlerResult", HandlerResult.json(resp));
@@ -216,28 +273,71 @@ public class Server {
 
             logReqSigningHeaders(ex, "/api/login");
 
-            if (!verifyClientSignedRequest(ex, bodyBytes)) {
-                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad client request signature"));
+            long verifyStart = System.nanoTime();
+            Map<String, Object> requestVerify = verifyClientSignedRequestDetailed(ex, bodyBytes);
+            double verifyMs = nanosToMs(System.nanoTime() - verifyStart);
+
+            ex.getResponseHeaders().set("X-Metric-Req-Verify-Ms", formatMs(verifyMs));
+            ex.getResponseHeaders().set("X-Metric-Req-Header-Bytes", String.valueOf(approximateRequestHeaderBytes(ex)));
+            ex.getResponseHeaders().set("X-Metric-Req-Body-Bytes", String.valueOf(bodyBytes.length));
+            ex.getResponseHeaders().set("X-Metric-Req-Sign-Header-Bytes", String.valueOf(approximateRequestSigningHeaderBytes(ex)));
+
+            if (!Boolean.TRUE.equals(requestVerify.get("ok"))) {
+                Map<String, Object> resp = new LinkedHashMap<>();
+                resp.put("ok", false);
+                resp.put("error", "Bad client request signature");
+                resp.put("requestVerify", requestVerify);
+
+                appendHostEvent("login_bad_request_sig", ex, bodyBytes.length, Map.of(
+                        "req_verify_ms", formatMs(verifyMs)
+                ));
+
+                ex.setAttribute("handlerResult", HandlerResult.json(
+                        401,
+                        MAPPER.writeValueAsString(resp)
+                ));
                 return;
             }
 
             String usernameEnc = jsonField(body, "username");
             String passwordEnc = jsonField(body, "password");
 
+            long decryptStart = System.nanoTime();
             String user = tryDecryptAndValidate(usernameEnc);
             String pass = tryDecryptAndValidate(passwordEnc);
+            double decryptMs = nanosToMs(System.nanoTime() - decryptStart);
+            ex.getResponseHeaders().set("X-Metric-Decrypt-Ms", formatMs(decryptMs));
 
             boolean success = "alice".equals(user) && "secret".equals(pass);
+
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("ok", success);
+            resp.put("requestVerify", requestVerify);
 
             if (success) {
                 long now = System.currentTimeMillis() / 1000L;
                 long exp = now + 1800;
                 String session = "{\"u\":\"" + json(user) + "\",\"role\":\"admin\",\"iat\":" + now + ",\"exp\":" + exp + "}";
-                setCookie(ex, "sess", jweEncrypt(session), CookieOptions.defaultSession(1800));
-                ex.setAttribute("handlerResult", HandlerResult.json("{\"ok\":true}"));
+                String cookieVal = jweEncrypt(session);
+                CookieOptions opts = CookieOptions.defaultSession(1800);
+                setCookie(ex, "sess", cookieVal, opts);
+
+                resp.put("message", "Login OK");
+                resp.put("redirectTo", "/index.html");
             } else {
-                ex.setAttribute("handlerResult", HandlerResult.json("{\"ok\":false}"));
+                resp.put("error", "Invalid credentials");
             }
+
+            appendHostEvent("login", ex, bodyBytes.length, Map.of(
+                    "req_verify_ms", formatMs(verifyMs),
+                    "decrypt_ms", formatMs(decryptMs),
+                    "success", success
+            ));
+
+            ex.setAttribute("handlerResult", HandlerResult.json(
+                    200,
+                    MAPPER.writeValueAsString(resp)
+            ));
         } catch (Exception e) {
             ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
         }
@@ -250,8 +350,29 @@ public class Server {
 
             logReqSigningHeaders(ex, "/api/echo");
 
-            if (!verifyClientSignedRequest(ex, rawBytes)) {
-                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad client request signature"));
+            long verifyStart = System.nanoTime();
+            Map<String, Object> requestVerify = verifyClientSignedRequestDetailed(ex, rawBytes);
+            double verifyMs = nanosToMs(System.nanoTime() - verifyStart);
+
+            ex.getResponseHeaders().set("X-Metric-Req-Verify-Ms", formatMs(verifyMs));
+            ex.getResponseHeaders().set("X-Metric-Req-Header-Bytes", String.valueOf(approximateRequestHeaderBytes(ex)));
+            ex.getResponseHeaders().set("X-Metric-Req-Body-Bytes", String.valueOf(rawBytes.length));
+            ex.getResponseHeaders().set("X-Metric-Req-Sign-Header-Bytes", String.valueOf(approximateRequestSigningHeaderBytes(ex)));
+
+            if (!Boolean.TRUE.equals(requestVerify.get("ok"))) {
+                Map<String, Object> resp = new LinkedHashMap<>();
+                resp.put("ok", false);
+                resp.put("error", "Bad client request signature");
+                resp.put("requestVerify", requestVerify);
+
+                appendHostEvent("echo_bad_request_sig", ex, rawBytes.length, Map.of(
+                        "req_verify_ms", formatMs(verifyMs)
+                ));
+
+                ex.setAttribute("handlerResult", HandlerResult.json(
+                        401,
+                        MAPPER.writeValueAsString(resp)
+                ));
                 return;
             }
 
@@ -315,80 +436,18 @@ public class Server {
                 resp.put("notes", notes);
             }
 
-            ex.setAttribute("handlerResult", HandlerResult.json(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(resp)));
+            resp.put("requestVerify", requestVerify);
+
+            appendHostEvent("echo", ex, rawBytes.length, Map.of(
+                    "req_verify_ms", formatMs(verifyMs)
+            ));
+
+            ex.setAttribute("handlerResult", HandlerResult.json(
+                    200,
+                    MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(resp)
+            ));
         } catch (Exception e) {
             ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
-        }
-    }
-
-    private static boolean verifyClientSignedRequest(HttpExchange ex, byte[] bodyBytes) {
-        try {
-            String kid = headerFirst(ex, "X-Client-Key-Id");
-            String created = headerFirst(ex, "X-Req-Created");
-            String contentDigest = headerFirst(ex, "X-Req-Content-Digest");
-            String sigB64 = headerFirst(ex, "X-Req-Signature");
-
-            System.out.println("[REQ-VERIFY] endpoint=" + ex.getRequestURI());
-
-            if (kid == null || created == null || contentDigest == null || sigB64 == null) {
-                System.out.println("[REQ-VERIFY] FAIL missing signing headers");
-                return false;
-            }
-
-            long createdSec;
-            try {
-                createdSec = Long.parseLong(created);
-            } catch (Exception e) {
-                System.out.println("[REQ-VERIFY] FAIL bad X-Req-Created");
-                return false;
-            }
-
-            long nowSec = System.currentTimeMillis() / 1000L;
-            if (Math.abs(nowSec - createdSec) > 300) {
-                System.out.println("[REQ-VERIFY] FAIL X-Req-Created outside allowed window");
-                return false;
-            }
-
-            RSAPublicKey pub = CLIENT_REQ_PUBS.get(kid);
-            if (pub == null) {
-                System.out.println("[REQ-VERIFY] FAIL unknown client key id: " + kid);
-                return false;
-            }
-
-            String expectedDigest = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(bodyBytes)) + ":";
-
-            System.out.println("[REQ-VERIFY] received digest = " + contentDigest);
-            System.out.println("[REQ-VERIFY] expected digest = " + expectedDigest);
-
-            if (!expectedDigest.equals(contentDigest)) {
-                System.out.println("[REQ-VERIFY] FAIL request content digest mismatch");
-                return false;
-            }
-
-            String base = buildRequestSignatureBase(
-                    ex.getRequestMethod().toLowerCase(Locale.ROOT),
-                    ex.getRequestURI().toString(),
-                    created,
-                    contentDigest,
-                    kid
-            );
-
-            Signature verifier = Signature.getInstance("RSASSA-PSS");
-            verifier.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
-            verifier.initVerify(pub);
-            verifier.update(base.getBytes(StandardCharsets.UTF_8));
-
-            boolean ok = verifier.verify(Base64.getDecoder().decode(sigB64));
-
-            System.out.println("[REQ-VERIFY] signature base:");
-            System.out.println(base);
-            System.out.println("[REQ-VERIFY] signature valid = " + ok);
-            System.out.println(ok ? "[REQ-VERIFY] OK" : "[REQ-VERIFY] FAIL request signature verification failed");
-
-            return ok;
-        } catch (Exception e) {
-            System.out.println("[REQ-VERIFY] FAIL exception: " + e.getMessage());
-            return false;
         }
     }
 
@@ -408,13 +467,25 @@ public class Server {
             }
 
             boolean disableSigning = Boolean.TRUE.equals(ex.getAttribute("disableSigning"))
+                    || ex.getRequestURI().getPath().equals("/api/login_plain")
                     || ex.getRequestURI().getPath().startsWith("/unsigned/");
 
-            Headers headers = ex.getResponseHeaders();
+            Headers h = ex.getResponseHeaders();
 
             if (disableSigning) {
-                headers.set("Content-Type", result.contentType);
-                headers.set("Connection", "close");
+                h.set("Content-Type", result.contentType);
+                h.set("Connection", "close");
+
+                long headerBytes = approximateResponseHeaderBytes(h);
+                h.set("X-Metric-Resp-Body-Bytes", String.valueOf(result.body.length));
+                h.set("X-Metric-Resp-Header-Bytes", String.valueOf(headerBytes));
+                h.set("X-Metric-Resp-Total-Bytes", String.valueOf(headerBytes + result.body.length));
+
+                if ("HEAD".equalsIgnoreCase(ex.getRequestMethod())) {
+                    ex.sendResponseHeaders(result.status, -1);
+                    ex.close();
+                    return;
+                }
 
                 ex.sendResponseHeaders(result.status, result.body.length);
                 try (OutputStream os = ex.getResponseBody()) {
@@ -423,60 +494,71 @@ public class Server {
                 return;
             }
 
-            String demo = "";
-            String path = ex.getRequestURI().getPath();
-            if ("/api/login".equals(path) || "/api/echo".equals(path)) {
-                demo = normalizeDemo(getQueryParam(ex.getRequestURI().getRawQuery(), "demo"));
-            }
+            String tamper = normalizeTamperMode(getQueryParam(ex.getRequestURI().getRawQuery(), "demo"));
 
-            byte[] body = result.body;
-            String correctDigest = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(body)) + ":";
-            String sendDigest = correctDigest;
+            byte[] originalBody = result.body;
+            int status = result.status;
 
-            if ("resp-bad-digest".equals(demo)) {
-                sendDigest = "sha-256=:" + Base64.getEncoder().encodeToString(new byte[32]) + ":";
-                System.out.println("[RESP-SEND] demo wrong response digest active");
-                System.out.println("[RESP-SEND] actual digest = " + correctDigest);
-                System.out.println("[RESP-SEND] sent   digest = " + sendDigest);
-            } else {
-                System.out.println("[RESP-SEND] normal response digest = " + correctDigest);
-            }
-
+            String digestHeader = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(originalBody)) + ":";
             long created = System.currentTimeMillis() / 1000L;
             String method = ex.getRequestMethod().toLowerCase(Locale.ROOT);
             String target = ex.getRequestURI().toString();
-            int status = result.status;
 
             String sigInput =
                     "(\"@method\" \"@target-uri\" \"@status\" \"content-digest\");"
                             + "created=" + created + ";"
-                            + "keyid=\"" + SIG_KID + "\";"
+                            + "keyid=\"sig-key-1\";"
                             + "alg=\"rsa-pss-sha256\"";
 
-            String signatureBase =
+            String base =
                     "\"@method\": \"" + method + "\"\n"
                             + "\"@target-uri\": \"" + target + "\"\n"
                             + "\"@status\": " + status + "\n"
-                            + "content-digest: " + sendDigest + "\n"
+                            + "content-digest: " + digestHeader + "\n"
                             + "\"@signature-params\": " + sigInput;
 
+            long signStart = System.nanoTime();
             String sigB64;
             try {
-                byte[] sig = signPss(signatureBase.getBytes(StandardCharsets.US_ASCII), SIG_PRIV);
+                byte[] sig = signPss(base.getBytes(StandardCharsets.US_ASCII), SIG_PRIV);
                 sigB64 = Base64.getEncoder().encodeToString(sig);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
+            double signMs = nanosToMs(System.nanoTime() - signStart);
 
-            headers.set("Content-Type", result.contentType);
-            headers.set("Connection", "close");
-            headers.set("Content-Digest", sendDigest);
-            headers.set("Signature-Input", "sig1=" + sigInput);
-            headers.set("Signature", "sig1=:" + sigB64 + ":");
+            byte[] sendBody = originalBody;
+            String sendDigest = digestHeader;
+            String sendSigB64 = sigB64;
 
-            ex.sendResponseHeaders(status, body.length);
+            if ("resp-bad-digest".equals(tamper)) {
+                sendDigest = "sha-256=:" + Base64.getEncoder().encodeToString(new byte[32]) + ":";
+            }
+
+            h.set("Content-Type", result.contentType);
+            h.set("Connection", "close");
+            h.set("Content-Digest", sendDigest);
+            h.set("Signature-Input", "sig1=" + sigInput);
+            h.set("Signature", "sig1=:" + sendSigB64 + ":");
+
+            h.set("X-Metric-Sign-Ms", formatMs(signMs));
+
+            long headerBytes = approximateResponseHeaderBytes(h);
+            h.set("X-Metric-Resp-Body-Bytes", String.valueOf(sendBody.length));
+            h.set("X-Metric-Resp-Header-Bytes", String.valueOf(headerBytes));
+            h.set("X-Metric-Resp-Total-Bytes", String.valueOf(headerBytes + sendBody.length));
+
+            appendHostResponseMetric(ex, status, sendBody.length, headerBytes, signMs);
+
+            if ("HEAD".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(status, -1);
+                ex.close();
+                return;
+            }
+
+            ex.sendResponseHeaders(status, sendBody.length);
             try (OutputStream os = ex.getResponseBody()) {
-                os.write(body);
+                os.write(sendBody);
             }
         }
     }
@@ -488,15 +570,15 @@ public class Server {
         }
 
         @Override
-        public void doFilter(HttpExchange ex, Chain chain) throws IOException {
+        public void doFilter(HttpExchange ex, Chain c) throws IOException {
             String s = getCookie(ex, "sess");
             if (s != null) {
-                String payload = jweDecrypt(s);
-                if (payload != null) {
-                    ex.setAttribute("session.user", jsonField(payload, "u"));
+                String p = jweDecrypt(s);
+                if (p != null) {
+                    ex.setAttribute("session.user", jsonField(p, "u"));
                 }
             }
-            chain.doFilter(ex);
+            c.doFilter(ex);
         }
     }
 
@@ -507,27 +589,28 @@ public class Server {
         Long maxAgeSeconds = null;
 
         static CookieOptions defaultSession(long secs) {
-            CookieOptions options = new CookieOptions();
-            options.maxAgeSeconds = secs;
-            return options;
+            CookieOptions o = new CookieOptions();
+            o.maxAgeSeconds = secs;
+            return o;
         }
     }
 
-    static void setCookie(HttpExchange ex, String name, String value, CookieOptions options) {
+    static void setCookie(HttpExchange ex, String name, String value, CookieOptions o) {
         StringBuilder sb = new StringBuilder();
         sb.append(name).append("=").append(value != null ? value : "");
-        if (options.path != null) {
-            sb.append("; Path=").append(options.path);
+        if (o.path != null) {
+            sb.append("; Path=").append(o.path);
         }
-        if (options.maxAgeSeconds != null) {
-            sb.append("; Max-Age=").append(options.maxAgeSeconds);
-            ZonedDateTime exp = ZonedDateTime.now(ZoneOffset.UTC).plusSeconds(options.maxAgeSeconds);
-            sb.append("; Expires=").append(DateTimeFormatter.RFC_1123_DATE_TIME.format(exp));
+        if (o.maxAgeSeconds != null) {
+            sb.append("; Max-Age=").append(o.maxAgeSeconds);
+            ZonedDateTime exp = ZonedDateTime.now(ZoneOffset.UTC).plusSeconds(o.maxAgeSeconds);
+            String date = DateTimeFormatter.RFC_1123_DATE_TIME.format(exp);
+            sb.append("; Expires=").append(date);
         }
-        if (options.secure) {
+        if (o.secure) {
             sb.append("; Secure");
         }
-        if (options.httpOnly) {
+        if (o.httpOnly) {
             sb.append("; HttpOnly");
         }
         ex.getResponseHeaders().add("Set-Cookie", sb.toString());
@@ -550,9 +633,9 @@ public class Server {
     }
 
     private static void rotateJweKeypair() throws Exception {
-        RsaJsonWebKey jwk = RsaJwkGenerator.generateJwk(2048);
-        JWE_PUB = (RSAPublicKey) jwk.getPublicKey();
-        JWE_PRIV = (RSAPrivateKey) jwk.getPrivateKey();
+        RsaJsonWebKey j = RsaJwkGenerator.generateJwk(2048);
+        JWE_PUB = (RSAPublicKey) j.getPublicKey();
+        JWE_PRIV = (RSAPrivateKey) j.getPrivateKey();
     }
 
     private static String jweEncrypt(String json) throws JoseException {
@@ -585,11 +668,11 @@ public class Server {
     }
 
     private static byte[] signPss(byte[] input, PrivateKey key) throws Exception {
-        Signature signer = Signature.getInstance("RSASSA-PSS");
-        signer.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
-        signer.initSign(key);
-        signer.update(input);
-        return signer.sign();
+        Signature s = Signature.getInstance("RSASSA-PSS");
+        s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+        s.initSign(key);
+        s.update(input);
+        return s.sign();
     }
 
     private static String b64urlUnsigned(byte[] in) {
@@ -604,7 +687,41 @@ public class Server {
                 + "\"thumbprint\": \"" + thumbprint + "\"";
     }
 
-    private static String buildRequestSignatureBase(
+    private static String computeReqSignJwkThumbprint(RsaJsonWebKey jwk) throws Exception {
+        RSAPublicKey pub = (RSAPublicKey) jwk.getPublicKey();
+        String n = b64urlUnsigned(pub.getModulus().toByteArray());
+        String e = b64urlUnsigned(pub.getPublicExponent().toByteArray());
+        String canonical = "{\"e\":\"" + e + "\",\"kty\":\"RSA\",\"n\":\"" + n + "\"}";
+        byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8));
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+    }
+
+    private static boolean verifyReqKeyRegistrationProof(RSAPublicKey pub, String proofBase, String proofB64) {
+        try {
+            Signature s = Signature.getInstance("RSASSA-PSS");
+            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.initVerify(pub);
+            s.update(proofBase.getBytes(StandardCharsets.UTF_8));
+            return s.verify(Base64.getDecoder().decode(proofB64));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static synchronized RSAPublicKey wrongClientReqVerifyPublicKey() throws Exception {
+        if (WRONG_CLIENT_REQ_VERIFY_PUB == null) {
+            KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+            kpg.initialize(2048);
+            WRONG_CLIENT_REQ_VERIFY_PUB = (RSAPublicKey) kpg.generateKeyPair().getPublic();
+        }
+        return WRONG_CLIENT_REQ_VERIFY_PUB;
+    }
+
+    private static String normalizeTamperMode(String mode) {
+        return mode == null ? "" : mode.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static String buildClientRequestSignatureBase(
             String methodLower,
             String target,
             String created,
@@ -618,32 +735,150 @@ public class Server {
                 + "\"x-client-key-id\": " + kid;
     }
 
-    private static String computeReqSignJwkThumbprint(RSAPublicKey pub) throws Exception {
-        String n = b64urlUnsigned(pub.getModulus().toByteArray());
-        String e = b64urlUnsigned(pub.getPublicExponent().toByteArray());
-        String canonical = "{\"e\":\"" + e + "\",\"kty\":\"RSA\",\"n\":\"" + n + "\"}";
-        byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8));
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
-    }
+    private static Map<String, Object> verifyClientSignedRequestDetailed(HttpExchange ex, byte[] bodyBytes) {
+        Map<String, Object> diag = new LinkedHashMap<>();
 
-    private static synchronized RSAPublicKey wrongClientReqVerifyPublicKey() throws Exception {
-        if (WRONG_CLIENT_REQ_VERIFY_PUB == null) {
-            KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
-            kpg.initialize(2048);
-            WRONG_CLIENT_REQ_VERIFY_PUB = (RSAPublicKey) kpg.generateKeyPair().getPublic();
+        String demo = normalizeTamperMode(getQueryParam(ex.getRequestURI().getRawQuery(), "demo"));
+        String kid = headerFirst(ex, "X-Client-Key-Id");
+        String created = headerFirst(ex, "X-Req-Created");
+        String contentDigest = headerFirst(ex, "X-Req-Content-Digest");
+        String signatureB64 = headerFirst(ex, "X-Req-Signature");
+
+        String methodLower = ex.getRequestMethod().toLowerCase(Locale.ROOT);
+        String target = ex.getRequestURI().toString();
+        String computedDigest = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(bodyBytes)) + ":";
+
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("method", ex.getRequestMethod());
+        request.put("targetUri", target);
+        diag.put("scope", "request");
+        diag.put("demo", demo.isBlank() ? "normal" : demo);
+        diag.put("request", request);
+
+        Map<String, Object> received = new LinkedHashMap<>();
+        received.put("clientKeyId", kid);
+        received.put("created", created);
+        received.put("contentDigest", contentDigest);
+        received.put("signature", signatureB64);
+        diag.put("received", received);
+
+        String signatureBase = buildClientRequestSignatureBase(
+                methodLower,
+                target,
+                String.valueOf(created),
+                String.valueOf(contentDigest),
+                String.valueOf(kid)
+        );
+
+        Map<String, Object> computed = new LinkedHashMap<>();
+        computed.put("contentDigest", computedDigest);
+        computed.put("signatureBase", signatureBase);
+        diag.put("computed", computed);
+
+        Map<String, Object> verificationKey = new LinkedHashMap<>();
+        verificationKey.put("claimedKeyId", kid);
+        diag.put("verificationKey", verificationKey);
+
+        Map<String, Object> checks = new LinkedHashMap<>();
+        checks.put("contentDigestMatches", contentDigest != null && computedDigest.equals(contentDigest));
+        checks.put("signatureValid", null);
+        checks.put("createdWithinWindow", null);
+        diag.put("checks", checks);
+
+        if (kid == null || kid.isBlank()) {
+            diag.put("ok", false);
+            diag.put("reason", "missing X-Client-Key-Id");
+            return diag;
         }
-        return WRONG_CLIENT_REQ_VERIFY_PUB;
-    }
+        if (created == null || created.isBlank()) {
+            diag.put("ok", false);
+            diag.put("reason", "missing X-Req-Created");
+            return diag;
+        }
+        if (contentDigest == null || contentDigest.isBlank()) {
+            diag.put("ok", false);
+            diag.put("reason", "missing X-Req-Content-Digest");
+            return diag;
+        }
+        if (signatureB64 == null || signatureB64.isBlank()) {
+            diag.put("ok", false);
+            diag.put("reason", "missing X-Req-Signature");
+            return diag;
+        }
 
-    private static boolean verifyReqKeyRegistrationProof(RSAPublicKey pub, String proofBase, String proofB64) {
+        long createdSec;
         try {
-            Signature verifier = Signature.getInstance("RSASSA-PSS");
-            verifier.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
-            verifier.initVerify(pub);
-            verifier.update(proofBase.getBytes(StandardCharsets.UTF_8));
-            return verifier.verify(Base64.getDecoder().decode(proofB64));
+            createdSec = Long.parseLong(created);
         } catch (Exception e) {
-            return false;
+            diag.put("ok", false);
+            diag.put("reason", "bad X-Req-Created");
+            return diag;
+        }
+
+        long nowSec = System.currentTimeMillis() / 1000L;
+        boolean createdWithinWindow = Math.abs(nowSec - createdSec) <= 300;
+        checks.put("createdWithinWindow", createdWithinWindow);
+        if (!createdWithinWindow) {
+            diag.put("ok", false);
+            diag.put("reason", "X-Req-Created outside allowed window");
+            return diag;
+        }
+
+        RSAPublicKey registeredPub = CLIENT_REQ_PUBS.get(kid);
+        RSAPublicKey verifyPub = registeredPub;
+
+        if ("req-wrong-key".equals(demo)) {
+            try {
+                verifyPub = wrongClientReqVerifyPublicKey();
+            } catch (Exception e) {
+                diag.put("ok", false);
+                diag.put("reason", "failed to prepare demo wrong public key: " + e.getMessage());
+                return diag;
+            }
+            verificationKey.put("source", "tampered-wrong-public-key");
+            verificationKey.put("usedKeyId", "demo-wrong-client-signing-key");
+        } else {
+            verificationKey.put("source", "registered-client-public-key");
+            verificationKey.put("usedKeyId", kid);
+        }
+
+        verificationKey.put("registeredKeyPresent", registeredPub != null);
+
+        if (verifyPub == null) {
+            diag.put("ok", false);
+            diag.put("reason", "unknown client key id: " + kid);
+            return diag;
+        }
+
+        if ("req-bad-digest".equals(demo)) {
+            checks.put("contentDigestMatches", false);
+            diag.put("ok", false);
+            diag.put("reason", "request content digest mismatch");
+            return diag;
+        }
+
+        if (!computedDigest.equals(contentDigest)) {
+            diag.put("ok", false);
+            diag.put("reason", "request content digest mismatch");
+            return diag;
+        }
+
+        try {
+            Signature s = Signature.getInstance("RSASSA-PSS");
+            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.initVerify(verifyPub);
+            s.update(signatureBase.getBytes(StandardCharsets.UTF_8));
+            boolean ok = s.verify(Base64.getDecoder().decode(signatureB64));
+
+            checks.put("signatureValid", ok);
+            diag.put("ok", ok);
+            diag.put("reason", ok ? null : "request signature verification failed");
+            return diag;
+        } catch (Exception e) {
+            checks.put("signatureValid", false);
+            diag.put("ok", false);
+            diag.put("reason", "request signature verification exception: " + e.getMessage());
+            return diag;
         }
     }
 
@@ -660,7 +895,10 @@ public class Server {
             enc = enc.substring(5).trim();
         }
         String payload = jweDecrypt(enc);
-        return payload != null && isSafeString(payload) ? payload : null;
+        if (payload != null && isSafeString(payload)) {
+            return payload;
+        }
+        return null;
     }
 
     private static boolean isSafeString(String input) {
@@ -669,14 +907,14 @@ public class Server {
         }
         String lower = input.toLowerCase(Locale.ROOT);
         String[] sql = {"select", "insert", "update", "delete", "--", ";drop ", "xp_"};
-        for (String token : sql) {
-            if (lower.contains(token)) {
+        for (String k : sql) {
+            if (lower.contains(k)) {
                 return false;
             }
         }
         String[] xss = {"<script", "javascript:", "onerror", "onload", "<img", "<iframe"};
-        for (String token : xss) {
-            if (lower.contains(token)) {
+        for (String x : xss) {
+            if (lower.contains(x)) {
                 return false;
             }
         }
@@ -691,6 +929,7 @@ public class Server {
         if (path.endsWith(".html")) return "text/html; charset=utf-8";
         if (path.endsWith(".css")) return "text/css; charset=utf-8";
         if (path.endsWith(".js")) return "application/javascript; charset=utf-8";
+        if (path.endsWith(".mjs")) return "application/javascript; charset=utf-8";
         if (path.endsWith(".json")) return "application/json; charset=utf-8";
         if (path.endsWith(".png")) return "image/png";
         if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
@@ -737,16 +976,14 @@ public class Server {
     }
 
     private static String headerFirst(HttpExchange ex, String name) {
-        List<String> values = ex.getRequestHeaders().get(name);
-        return (values == null || values.isEmpty()) ? null : values.get(0);
+        List<String> v = ex.getRequestHeaders().get(name);
+        return (v == null || v.isEmpty()) ? null : v.get(0);
     }
 
-    private static Map<String, Object> flattenHeaders(Headers headers) {
+    private static Map<String, Object> flattenHeaders(Headers h) {
         Map<String, Object> out = new LinkedHashMap<>();
-        for (Map.Entry<String, List<String>> e : headers.entrySet()) {
-            if (e.getValue() == null) {
-                continue;
-            }
+        for (Map.Entry<String, List<String>> e : h.entrySet()) {
+            if (e.getValue() == null) continue;
             if ("Cookie".equalsIgnoreCase(e.getKey())) {
                 out.put("Cookie", "[redacted]");
                 continue;
@@ -757,27 +994,27 @@ public class Server {
     }
 
     private static Map<String, Object> pickInterestingHeaders(HttpExchange ex) {
-        Map<String, Object> out = new LinkedHashMap<>();
-        String[] keys = {
+        Map<String, Object> m = new LinkedHashMap<>();
+        String[] keys = new String[]{
                 "Host", "Origin", "Referer",
                 "X-forwarded-for", "X-forwarded-proto", "X-forwarded-host", "X-forwarded-server",
                 "Content-type", "Content-length",
                 "X-custom", "X-Enc-X-Custom",
+                "Tailscale-user-name", "Tailscale-user-login",
+                "X-Run-Tag", "X-Req-Seq", "X-Bench-Kind",
                 "X-Client-Key-Id", "X-Req-Created", "X-Req-Content-Digest", "X-Req-Signature"
         };
-        for (String key : keys) {
-            String value = headerFirst(ex, key);
-            if (value != null) {
-                out.put(key, value);
+        for (String k : keys) {
+            String v = headerFirst(ex, k);
+            if (v != null) {
+                m.put(k, v);
             }
         }
-        return out;
+        return m;
     }
 
     private static String getQueryParam(String rawQuery, String key) {
-        if (rawQuery == null) {
-            return null;
-        }
+        if (rawQuery == null) return null;
         for (String part : rawQuery.split("&")) {
             String[] kv = part.split("=", 2);
             if (kv.length >= 1 && kv[0].equals(key)) {
@@ -799,14 +1036,11 @@ public class Server {
         return v == null ? null : String.valueOf(v);
     }
 
-    private static String normalizeDemo(String value) {
-        return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
-    }
-
     private static void logReqSigningHeaders(HttpExchange ex, String endpoint) {
         System.out.println("---- REQUEST SIGN HEADERS [" + endpoint + "] ----");
         System.out.println("method = " + ex.getRequestMethod());
         System.out.println("path   = " + ex.getRequestURI());
+
         System.out.println("X-Client-Key-Id      = " + headerFirst(ex, "X-Client-Key-Id"));
         System.out.println("X-Req-Created        = " + headerFirst(ex, "X-Req-Created"));
         System.out.println("X-Req-Content-Digest = " + headerFirst(ex, "X-Req-Content-Digest"));
@@ -815,10 +1049,117 @@ public class Server {
         if (sig == null) {
             System.out.println("X-Req-Signature      = null");
         } else {
-            String shortSig = sig.length() <= 80 ? sig : sig.substring(0, 40) + " ... " + sig.substring(sig.length() - 24);
+            String shortSig = sig.length() <= 80
+                    ? sig
+                    : sig.substring(0, 40) + " ... " + sig.substring(sig.length() - 24);
             System.out.println("X-Req-Signature      = " + shortSig + " (len=" + sig.length() + ")");
         }
+
         System.out.println("----------------------------------------------");
+    }
+
+    private static int approximateRequestHeaderBytes(HttpExchange ex) {
+        int total = 0;
+        for (Map.Entry<String, List<String>> e : ex.getRequestHeaders().entrySet()) {
+            String name = e.getKey();
+            for (String value : e.getValue()) {
+                total += name.getBytes(StandardCharsets.UTF_8).length + 2
+                        + value.getBytes(StandardCharsets.UTF_8).length + 2;
+            }
+        }
+        total += 2;
+        return total;
+    }
+
+    private static int approximateRequestSigningHeaderBytes(HttpExchange ex) {
+        int total = 0;
+        String[] names = {"X-Client-Key-Id", "X-Req-Created", "X-Req-Content-Digest", "X-Req-Signature"};
+        for (String name : names) {
+            String value = headerFirst(ex, name);
+            if (value != null) {
+                total += name.getBytes(StandardCharsets.UTF_8).length + 2
+                        + value.getBytes(StandardCharsets.UTF_8).length + 2;
+            }
+        }
+        return total;
+    }
+
+    private static long approximateResponseHeaderBytes(Headers headers) {
+        long total = 0;
+        for (Map.Entry<String, List<String>> e : headers.entrySet()) {
+            String name = e.getKey();
+            for (String value : e.getValue()) {
+                total += name.getBytes(StandardCharsets.UTF_8).length + 2L
+                        + value.getBytes(StandardCharsets.UTF_8).length + 2L;
+            }
+        }
+        total += 2;
+        return total;
+    }
+
+    private static int utf8Bytes(String s) {
+        return s == null ? 0 : s.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private static String formatMs(double ms) {
+        return String.format(Locale.ROOT, "%.3f", ms);
+    }
+
+    private static double nanosToMs(long nanos) {
+        return nanos / 1_000_000.0;
+    }
+
+    private static String isoNow() {
+        return ZonedDateTime.now(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+    }
+
+    private static synchronized void appendNdjson(String line) throws IOException {
+        Files.writeString(
+                METRICS_FILE,
+                line + System.lineSeparator(),
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.APPEND
+        );
+    }
+
+    private static void appendMetric(Map<String, Object> metric) throws IOException {
+        appendNdjson(MAPPER.writeValueAsString(metric));
+    }
+
+    private static void appendHostEvent(String eventName, HttpExchange ex, int reqBodyBytes, Map<String, Object> extra) throws IOException {
+        Map<String, Object> metric = new LinkedHashMap<>();
+        metric.put("event", eventName);
+        metric.put("at", isoNow());
+        metric.put("source", "host");
+        metric.put("method", ex.getRequestMethod());
+        metric.put("path", ex.getRequestURI().toString());
+        metric.put("req_header_bytes", approximateRequestHeaderBytes(ex));
+        metric.put("req_body_bytes", reqBodyBytes);
+        metric.putAll(extra);
+        appendMetric(metric);
+    }
+
+    private static void appendHostResponseMetric(HttpExchange ex, int status, int bodyBytes, long headerBytes, double signMs) throws IOException {
+        Map<String, Object> metric = new LinkedHashMap<>();
+        metric.put("event", "response_signed");
+        metric.put("at", isoNow());
+        metric.put("source", "host");
+        metric.put("method", ex.getRequestMethod());
+        metric.put("path", ex.getRequestURI().toString());
+        metric.put("status", status);
+        metric.put("resp_sign_ms", formatMs(signMs));
+        metric.put("resp_body_bytes", bodyBytes);
+        metric.put("resp_header_bytes", headerBytes);
+        metric.put("resp_total_bytes", headerBytes + bodyBytes);
+        appendMetric(metric);
+    }
+
+    private static void setCorsForMetrics(HttpExchange ex) {
+        Headers h = ex.getResponseHeaders();
+        h.set("Access-Control-Allow-Origin", "https://masteroppgave2026.no");
+        h.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+        h.set("Access-Control-Allow-Headers", "Content-Type");
     }
 
     static class HandlerResult {
@@ -830,6 +1171,10 @@ public class Server {
             return new HandlerResult(200, "application/json; charset=utf-8", body.getBytes(StandardCharsets.UTF_8));
         }
 
+        static HandlerResult json(int status, String body) {
+            return new HandlerResult(status, "application/json; charset=utf-8", body.getBytes(StandardCharsets.UTF_8));
+        }
+
         static HandlerResult text(int status, String msg) {
             return new HandlerResult(status, "text/plain; charset=utf-8", msg.getBytes(StandardCharsets.UTF_8));
         }
@@ -839,7 +1184,7 @@ public class Server {
         }
 
         static HandlerResult error(String msg) {
-            return json("{\"error\":\"" + Server.json(msg) + "\"}");
+            return json(500, "{\"error\":\"" + Server.json(msg) + "\"}");
         }
 
         HandlerResult(int status, String contentType, byte[] body) {

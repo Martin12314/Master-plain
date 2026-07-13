@@ -1,26 +1,32 @@
-let sigVerifyKey = null;
-let sigVerifyKid = null;
-
-let reqSignKeypair = null;
-let reqSignKid = null;
-let reqSignThumbprint = null;
-let reqSignReady = false;
-
-let hostJweJwk = null;
-let hostJweKid = null;
-let protectedFlowBootstrapPromise = null;
-
-const APP_ORIGIN = 'https://app.masteroppgave2026.no';
-
 const TRUSTED_SIG_PUB_JWK = {
   kty: 'RSA',
   kid: 'sig-key-1',
+  use: 'sig',
   alg: 'PS256',
   n: 'wSOfiQdpVMMEeqJv-Nz_yifuyOJb6TglNPD7wrkexmlRpe4u7QyUscTfBQbt6rNxKjIv9W9LGhy4hk7WqwHVBLFBE_uvF0-SIjxDdL2EecV7Xd4-iRnjj2aQV0NVRguE01O1ZKl-vJDxbzFBuUhjwmgxSxFvudjN-owZYdTk-qaqn0kFaGsSqfS70hUgL8WV_gkMNhWAhlOQcVgfcC4xesafCMolEO1bZ-XO1l_gcGW4k8Dr6U7vozaZTvjQUjeF_fXlHbXOWsRgOxU61qe8RSmFFXAuYTkcP_KXpSgQxC8XojR04DLQfJTobf1O0LzeS0IPNuqxgOCH-zuyLdSYsQ',
   e: 'AQAB'
 };
 
-const BOOTSTRAP_PATHS = new Set(['/sw.js']);
+let SIG_VERIFY_KEY = null;
+let SIG_VERIFY_KID = null;
+
+let REQ_SIGN_KEYPAIR = null;
+let REQ_SIGN_KID = null;
+let REQ_SIGN_THUMBPRINT = null;
+let REQ_SIGN_READY = false;
+
+let HOST_JWE_JWK = null;
+let HOST_JWE_KID = null;
+let PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
+
+const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+const METRICS_URL = APP_ORIGIN + '/metrics';
+
+const BOOTSTRAP_PATHS = new Set([
+  '/sw.js',
+  '/Installer.js',
+  '/installer.js',
+]);
 
 function log(...args) {
   const msg = args.join(' ');
@@ -37,46 +43,62 @@ function log(...args) {
   });
 }
 
-function logJson(title, obj) {
-  log(`${title}\n${JSON.stringify(obj, null, 2)}`);
-}
-
-function normalizeDemo(mode) {
-  return String(mode || '').trim().toLowerCase();
-}
-
-function getDemoForApi(url) {
-  if (url.pathname !== '/api/login' && url.pathname !== '/api/echo') {
-    return '';
-  }
-  return normalizeDemo(url.searchParams.get('demo'));
-}
-
-function shouldBypassSecurity(url) {
-  return url.pathname.startsWith('/unsigned/');
-}
-
-function shouldSignRequest(url, method) {
-  const m = String(method || 'GET').toUpperCase();
-  if (m === 'GET' || m === 'HEAD') return false;
-  return url.pathname === '/api/login' || url.pathname === '/api/echo';
+function ms3(v) {
+  return Number(Number(v).toFixed(3));
 }
 
 async function ensureSigVerifyKeyReady() {
-  if (sigVerifyKey) {
+  if (SIG_VERIFY_KEY) {
     return;
   }
 
-  sigVerifyKey = await crypto.subtle.importKey(
+  SIG_VERIFY_KEY = await crypto.subtle.importKey(
     'jwk',
     TRUSTED_SIG_PUB_JWK,
     { name: 'RSA-PSS', hash: 'SHA-256' },
     false,
     ['verify']
   );
+  SIG_VERIFY_KID = TRUSTED_SIG_PUB_JWK.kid || '?';
+  log('signature verification key loaded from local SW keystore (kid=' + SIG_VERIFY_KID + ')');
+}
 
-  sigVerifyKid = TRUSTED_SIG_PUB_JWK.kid || '?';
-  log('signature verification key loaded from local SW keystore (kid=' + sigVerifyKid + ')');
+function shouldBypassSecurity(url) {
+  return (
+    url.searchParams.get('sw-bypass') === '1' ||
+    url.pathname.startsWith('/unsigned/')
+  );
+}
+
+function shouldSignRequest(url, method) {
+  method = String(method || 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD') return false;
+
+  return (
+    url.pathname === '/api/login' ||
+    url.pathname === '/api/echo'
+  );
+}
+
+async function postMetric(eventName, fields = {}) {
+  const payload = {
+    event: eventName,
+    at: new Date().toISOString(),
+    source: 'service-worker',
+    ...fields
+  };
+
+  try {
+    await fetch(METRICS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    console.warn('[SW] metric send failed', e);
+  }
 }
 
 self.addEventListener('install', event => {
@@ -125,111 +147,162 @@ function parseSigHeader(sig) {
 }
 
 function isProtectedContentType(ct) {
-  const value = (ct || '').toLowerCase();
+  ct = (ct || '').toLowerCase();
   return (
-    value.includes('text/html') ||
-    value.includes('application/json') ||
-    value.includes('application/javascript') ||
-    value.includes('text/javascript') ||
-    value.includes('text/css') ||
-    value.includes('image/png') ||
-    value.includes('image/jpeg') ||
-    value.includes('image/webp') ||
-    value.includes('image/svg+xml')
+    ct.includes('text/html') ||
+    ct.includes('application/json') ||
+    ct.includes('application/javascript') ||
+    ct.includes('text/javascript') ||
+    ct.includes('text/css') ||
+    ct.includes('image/png') ||
+    ct.includes('image/jpeg') ||
+    ct.includes('image/webp') ||
+    ct.includes('image/svg+xml')
   );
 }
 
-async function computeDigestHeader(bodyBytes) {
-  const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
-  return 'sha-256=:' + bytesToB64(actualHash) + ':';
-}
-
-function buildResponseSignatureBase(response, method, targetUri) {
-  const cd = response.headers.get('Content-Digest');
-  const sigInput = response.headers.get('Signature-Input');
-  if (!cd || !sigInput) {
+function safeHeader(headers, name) {
+  try {
+    return headers.get(name);
+  } catch {
     return null;
   }
-  const params = sigInput.replace(/^sig1=/, '');
+}
+
+function approximateSelectedHeaderBytes(headers, names) {
+  let total = 0;
+  const enc = new TextEncoder();
+  for (const name of names) {
+    const value = headers.get(name);
+    if (value != null) {
+      total += enc.encode(name).length + 2 + enc.encode(value).length + 1;
+    }
+  }
+  return total + 1;
+}
+
+function buildResponseSignatureBase(method, targetUri, status, contentDigest, signatureInputValue) {
+  const params = signatureInputValue.replace(/^sig1=/, '');
   return (
     `"@method": "${String(method).toLowerCase()}"\n` +
     `"@target-uri": "${targetUri}"\n` +
-    `"@status": ${response.status}\n` +
-    `content-digest: ${cd}\n` +
+    `"@status": ${status}\n` +
+    `content-digest: ${contentDigest}\n` +
     `"@signature-params": ${params}`
   );
 }
 
-async function buildResponseVerifyLog(response, bodyBytes, method, targetUri) {
-  const contentDigest = response.headers.get('Content-Digest');
-  const signature = response.headers.get('Signature');
-  const signatureInput = response.headers.get('Signature-Input');
-  const computedDigest = await computeDigestHeader(bodyBytes);
-  const signatureBase = buildResponseSignatureBase(response, method, targetUri);
+async function verifyResponseDetailed(response, bodyBytes, method, targetUri) {
+  await ensureSigVerifyKeyReady();
 
-  const info = {
+  const diag = {
     method,
     targetUri,
     status: response.status,
-    receivedDigest: contentDigest,
-    computedDigest,
-    digestMatches: contentDigest === computedDigest,
-    verificationKeyId: sigVerifyKid,
-    signatureInput,
-    signature,
-    signatureBase,
-    signatureValid: null
+    receivedDigest: safeHeader(response.headers, 'Content-Digest'),
+    computedDigest: null,
+    digestMatches: false,
+    verificationKeyId: SIG_VERIFY_KID,
+    signatureInput: safeHeader(response.headers, 'Signature-Input'),
+    signature: safeHeader(response.headers, 'Signature'),
+    signatureBase: null,
+    signatureValid: null,
+    digestMs: null,
+    signatureMs: null,
+    totalMs: null,
+    error: null
   };
 
-  if (!contentDigest || !signature || !signatureInput) {
-    info.error = 'missing security headers';
-    return info;
+  try {
+    const digestStarted = performance.now();
+    const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
+    const actualB64 = bytesToB64(actualHash);
+    diag.computedDigest = `sha-256=:${actualB64}:`;
+
+    if (!diag.receivedDigest || !diag.signatureInput || !diag.signature) {
+      diag.error = 'missing security headers';
+      return diag;
+    }
+
+    const expectedB64 = parseDigestHeader(diag.receivedDigest);
+    if (!expectedB64) {
+      diag.error = 'bad Content-Digest format';
+      return diag;
+    }
+
+    diag.digestMatches = actualB64 === expectedB64;
+    diag.digestMs = ms3(performance.now() - digestStarted);
+
+    if (!diag.digestMatches) {
+      diag.error = 'digest mismatch';
+      diag.totalMs = diag.digestMs;
+      return diag;
+    }
+
+    const sigStarted = performance.now();
+    const sigB64 = parseSigHeader(diag.signature);
+    if (!sigB64) {
+      diag.error = 'bad Signature format';
+      diag.totalMs = ms3((diag.digestMs || 0) + (performance.now() - sigStarted));
+      return diag;
+    }
+
+    diag.signatureBase = buildResponseSignatureBase(
+      method,
+      targetUri,
+      response.status,
+      diag.receivedDigest,
+      diag.signatureInput
+    );
+
+    diag.signatureValid = await crypto.subtle.verify(
+      { name: 'RSA-PSS', saltLength: 32 },
+      SIG_VERIFY_KEY,
+      b64ToBytes(sigB64),
+      new TextEncoder().encode(diag.signatureBase)
+    );
+    diag.signatureMs = ms3(performance.now() - sigStarted);
+    diag.totalMs = ms3((diag.digestMs || 0) + (diag.signatureMs || 0));
+
+    if (!diag.signatureValid) {
+      diag.error = 'signature verification failed';
+    }
+
+    return diag;
+  } catch (e) {
+    diag.error = e?.message || String(e);
+    return diag;
   }
-
-  if (!parseDigestHeader(contentDigest)) {
-    info.error = 'bad Content-Digest format';
-    return info;
-  }
-
-  if (contentDigest !== computedDigest) {
-    info.error = 'digest mismatch';
-    return info;
-  }
-
-  const sigB64 = parseSigHeader(signature);
-  if (!sigB64) {
-    info.error = 'bad Signature format';
-    return info;
-  }
-
-  const ok = await crypto.subtle.verify(
-    { name: 'RSA-PSS', saltLength: 32 },
-    sigVerifyKey,
-    b64ToBytes(sigB64),
-    new TextEncoder().encode(signatureBase)
-  );
-
-  info.signatureValid = ok;
-  if (!ok) {
-    info.error = 'signature verification failed';
-  }
-
-  return info;
 }
 
 async function verifyResponse(response, bodyBytes, method, targetUri) {
-  await ensureSigVerifyKeyReady();
-  const info = await buildResponseVerifyLog(response, bodyBytes, method, targetUri);
-  logJson(info.error ? 'Response verification FAILED' : 'Response verification OK', info);
-  if (info.error) {
-    throw new Error(info.error);
+  const diag = await verifyResponseDetailed(response, bodyBytes, method, targetUri);
+
+  if (!diag.digestMatches || !diag.signatureValid) {
+    log('Response verification FAILED\n' + JSON.stringify(diag, null, 2));
+    throw new Error(diag.error || 'response verification failed');
   }
+
+  await postMetric('response_verify', {
+    path: targetUri,
+    method,
+    status: response.status,
+    digest_ms: diag.digestMs,
+    signature_ms: diag.signatureMs,
+    total_ms: diag.totalMs,
+    resp_sign_ms: safeHeader(response.headers, 'X-Metric-Sign-Ms'),
+    resp_body_bytes: safeHeader(response.headers, 'X-Metric-Resp-Body-Bytes'),
+    resp_header_bytes: safeHeader(response.headers, 'X-Metric-Resp-Header-Bytes'),
+    resp_total_bytes: safeHeader(response.headers, 'X-Metric-Resp-Total-Bytes')
+  });
+
+  return diag;
 }
 
 async function fetchVerifiedJson(method, targetUri, init = {}) {
   await ensureSigVerifyKeyReady();
 
-  const response = await fetch(APP_ORIGIN + targetUri, {
+  const r = await fetch(APP_ORIGIN + targetUri, {
     method,
     mode: 'cors',
     cache: 'no-store',
@@ -238,11 +311,11 @@ async function fetchVerifiedJson(method, targetUri, init = {}) {
     ...init
   });
 
-  const bodyBytes = await response.clone().arrayBuffer();
-  await verifyResponse(response, bodyBytes, method, targetUri);
+  const bodyBytes = await r.clone().arrayBuffer();
+  await verifyResponse(r, bodyBytes, method, targetUri);
 
-  if (!response.ok) {
-    throw new Error(`${targetUri} failed HTTP ${response.status}`);
+  if (!r.ok) {
+    throw new Error(`${targetUri} failed HTTP ${r.status}`);
   }
 
   return JSON.parse(new TextDecoder().decode(bodyBytes));
@@ -252,7 +325,12 @@ function canonicalizeReqSignPublicJwk(jwk) {
   if (!jwk || jwk.kty !== 'RSA' || !jwk.n || !jwk.e) {
     throw new Error('invalid request-sign public JWK');
   }
-  return JSON.stringify({ e: jwk.e, kty: 'RSA', n: jwk.n });
+
+  return JSON.stringify({
+    e: jwk.e,
+    kty: 'RSA',
+    n: jwk.n
+  });
 }
 
 async function computeReqSignJwkThumbprint(jwk) {
@@ -262,25 +340,36 @@ async function computeReqSignJwkThumbprint(jwk) {
 }
 
 function buildReqKeyRegistrationProofBase(kid, thumbprint) {
-  return `"kid": "${kid}"\n"thumbprint": "${thumbprint}"`;
+  return (
+    `"kid": "${kid}"\n` +
+    `"thumbprint": "${thumbprint}"`
+  );
 }
 
 async function generateReqSigningKeypair() {
-  if (reqSignKeypair) {
-    const jwk = await crypto.subtle.exportKey('jwk', reqSignKeypair.publicKey);
+  if (REQ_SIGN_KEYPAIR) {
+    const exportStarted = performance.now();
+    const jwk = await crypto.subtle.exportKey('jwk', REQ_SIGN_KEYPAIR.publicKey);
+    const exportMs = performance.now() - exportStarted;
+
     jwk.alg = 'PS256';
     jwk.use = 'sig';
-    jwk.kid = reqSignKid;
+    jwk.kid = REQ_SIGN_KID;
+
     return {
-      kid: reqSignKid,
+      kid: REQ_SIGN_KID,
       jwk,
-      privateKey: reqSignKeypair.privateKey,
+      keygenMs: 0,
+      exportMs: ms3(exportMs),
+      totalMs: ms3(exportMs),
       reused: true
     };
   }
 
-  reqSignKid = 'sw-req-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-  reqSignKeypair = await crypto.subtle.generateKey(
+  REQ_SIGN_KID = 'sw-req-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+
+  const keygenStarted = performance.now();
+  REQ_SIGN_KEYPAIR = await crypto.subtle.generateKey(
     {
       name: 'RSA-PSS',
       modulusLength: 2048,
@@ -290,42 +379,22 @@ async function generateReqSigningKeypair() {
     true,
     ['sign', 'verify']
   );
+  const keygenMs = performance.now() - keygenStarted;
 
-  const jwk = await crypto.subtle.exportKey('jwk', reqSignKeypair.publicKey);
+  const exportStarted = performance.now();
+  const jwk = await crypto.subtle.exportKey('jwk', REQ_SIGN_KEYPAIR.publicKey);
+  const exportMs = performance.now() - exportStarted;
+
   jwk.alg = 'PS256';
   jwk.use = 'sig';
-  jwk.kid = reqSignKid;
+  jwk.kid = REQ_SIGN_KID;
 
   return {
-    kid: reqSignKid,
+    kid: REQ_SIGN_KID,
     jwk,
-    privateKey: reqSignKeypair.privateKey,
-    reused: false
-  };
-}
-
-async function generateEphemeralReqSigningKeypair() {
-  const kid = 'sw-demo-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-  const keypair = await crypto.subtle.generateKey(
-    {
-      name: 'RSA-PSS',
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256'
-    },
-    true,
-    ['sign', 'verify']
-  );
-
-  const jwk = await crypto.subtle.exportKey('jwk', keypair.publicKey);
-  jwk.alg = 'PS256';
-  jwk.use = 'sig';
-  jwk.kid = kid;
-
-  return {
-    kid,
-    jwk,
-    privateKey: keypair.privateKey,
+    keygenMs: ms3(keygenMs),
+    exportMs: ms3(exportMs),
+    totalMs: ms3(keygenMs + exportMs),
     reused: false
   };
 }
@@ -334,111 +403,138 @@ async function fetchVerifiedHostJweJwk() {
   await ensureSigVerifyKeyReady();
 
   const targetUri = '/key-exchange';
-  const response = await fetch(APP_ORIGIN + targetUri, {
+  const upstreamUrl = APP_ORIGIN + targetUri;
+
+  const fetchStarted = performance.now();
+  const r = await fetch(upstreamUrl, {
     method: 'GET',
     mode: 'cors',
     cache: 'no-store',
     redirect: 'follow',
     credentials: 'omit'
   });
+  const fetchMs = performance.now() - fetchStarted;
 
-  if (!response.ok) {
-    throw new Error('key-exchange failed HTTP ' + response.status);
+  if (!r.ok) {
+    throw new Error('key-exchange failed HTTP ' + r.status);
   }
 
-  const bodyBytes = await response.clone().arrayBuffer();
-  await verifyResponse(response, bodyBytes, 'GET', targetUri);
+  const bodyBytes = await r.clone().arrayBuffer();
+  const verifyDiag = await verifyResponse(r, bodyBytes, 'GET', targetUri);
 
+  const parseStarted = performance.now();
   const jwk = JSON.parse(new TextDecoder().decode(bodyBytes));
-  if (!jwk || !jwk.n || !jwk.e) {
+  const parseMs = performance.now() - parseStarted;
+
+  if (!jwk || jwk.kty !== 'RSA' || !jwk.n || !jwk.e) {
     throw new Error('invalid host JWE key');
   }
 
-  hostJweJwk = jwk;
-  hostJweKid = jwk.kid || '(no-kid)';
-  log('verified host JWE key fetched (kid=' + hostJweKid + ')');
+  HOST_JWE_JWK = jwk;
+  HOST_JWE_KID = jwk.kid || '(no-kid)';
+
+  await postMetric('key_exchange', {
+    path: targetUri,
+    http_status: r.status,
+    fetch_ms: ms3(fetchMs),
+    verify_ms: verifyDiag.totalMs,
+    parse_ms: ms3(parseMs),
+    total_ms: ms3(fetchMs + (verifyDiag.totalMs || 0) + parseMs)
+  });
+
+  log('verified host JWE key fetched (kid=' + HOST_JWE_KID + ')');
   return jwk;
 }
 
-async function registerReqSigningKeyWithServer(demo = '', ephemeral = false) {
-  const currentHostJwk = hostJweJwk || await fetchVerifiedHostJweJwk();
-  const material = ephemeral ? await generateEphemeralReqSigningKeypair() : await generateReqSigningKeypair();
+async function registerReqSigningKeyWithServer() {
+  const hostJwk = HOST_JWE_JWK || await fetchVerifiedHostJweJwk();
+  const result = await generateReqSigningKeypair();
 
-  const thumbprint = await computeReqSignJwkThumbprint(material.jwk);
-  const proofBase = buildReqKeyRegistrationProofBase(material.kid, thumbprint);
+  const thumbStarted = performance.now();
+  const thumbprint = await computeReqSignJwkThumbprint(result.jwk);
+  const thumbMs = performance.now() - thumbStarted;
 
+  const proofBase = buildReqKeyRegistrationProofBase(result.kid, thumbprint);
+
+  const proofStarted = performance.now();
   const proofBuf = await crypto.subtle.sign(
     { name: 'RSA-PSS', saltLength: 32 },
-    material.privateKey,
+    REQ_SIGN_KEYPAIR.privateKey,
     new TextEncoder().encode(proofBase)
   );
+  const proofMs = performance.now() - proofStarted;
 
-  const targetUri = demo ? '/req-key/register?demo=' + encodeURIComponent(demo) : '/req-key/register';
+  log('registering request-sign public key with server (kid=' + result.kid + ', thumb=' + thumbprint + ')');
 
-  log('registering request-sign public key with server (kid=' + material.kid + ', thumb=' + thumbprint + ')');
-
-  const response = await fetchVerifiedJson('POST', targetUri, {
+  const regStarted = performance.now();
+  const j = await fetchVerifiedJson('POST', '/req-key/register', {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      kid: material.kid,
-      jwk: material.jwk,
+      kid: result.kid,
+      jwk: result.jwk,
       jwkThumbprint: thumbprint,
       proof: bytesToB64(proofBuf)
     })
   });
+  const regMs = performance.now() - regStarted;
 
-  log('[REQ-KEY-REGISTER] client thumbprint = ' + thumbprint);
-  log('[REQ-KEY-REGISTER] host   thumbprint = ' + (response?.acceptedThumbprint || '(missing)'));
+  if (!j?.ok) throw new Error('request-sign registration not accepted');
+  if (j.acceptedKid !== result.kid) throw new Error('request-sign registration kid mismatch');
+  if (j.acceptedThumbprint !== thumbprint) throw new Error('request-sign registration thumbprint mismatch');
 
-  if (!response?.ok) {
-    throw new Error('request-sign registration not accepted');
-  }
-  if (response.acceptedKid !== material.kid) {
-    throw new Error('request-sign registration kid mismatch');
-  }
-  if (response.acceptedThumbprint !== thumbprint) {
-    throw new Error('request-sign registration thumbprint mismatch');
-  }
+  REQ_SIGN_THUMBPRINT = thumbprint;
+  REQ_SIGN_READY = true;
 
-  if (!ephemeral) {
-    reqSignThumbprint = thumbprint;
-    reqSignReady = true;
-  }
+  await postMetric('req_key_register', {
+    req_sign_kid: result.kid,
+    req_sign_thumbprint: thumbprint,
+    sw_req_keygen_ms: result.keygenMs,
+    sw_req_key_export_ms: result.exportMs,
+    sw_req_key_total_ms: result.totalMs,
+    sw_req_key_reused: result.reused,
+    sw_req_key_thumbprint_ms: ms3(thumbMs),
+    sw_req_key_proof_ms: ms3(proofMs),
+    sw_req_key_register_ms: ms3(regMs)
+  });
 
   return {
     ok: true,
-    reqSignKid: material.kid,
+    reqSignKid: result.kid,
     reqSignThumbprint: thumbprint,
-    hostJweKid: currentHostJwk.kid || '(no-kid)',
-    hostJweJwk: currentHostJwk,
-    reused: material.reused
+    hostJweKid: hostJwk.kid || '(no-kid)',
+    hostJweJwk: hostJwk,
+    sw_req_keygen_ms: result.keygenMs,
+    sw_req_key_export_ms: result.exportMs,
+    sw_req_key_total_ms: result.totalMs,
+    sw_req_key_reused: result.reused,
+    sw_req_key_proof_ms: ms3(proofMs)
   };
 }
 
 async function ensureProtectedFlowReady() {
-  await ensureSigVerifyKeyReady();
-
-  if (hostJweJwk && reqSignReady && reqSignKid && reqSignThumbprint) {
+  if (HOST_JWE_JWK && REQ_SIGN_READY && REQ_SIGN_KID && REQ_SIGN_THUMBPRINT) {
     return {
       ok: true,
       reqSignReady: true,
-      reqSignKid,
-      reqSignThumbprint,
-      hostJweKid,
-      hostJweJwk,
+      reqSignKid: REQ_SIGN_KID,
+      reqSignThumbprint: REQ_SIGN_THUMBPRINT,
+      hostJweKid: HOST_JWE_KID,
+      hostJweJwk: HOST_JWE_JWK,
       reused: true
     };
   }
 
-  if (protectedFlowBootstrapPromise) {
-    return await protectedFlowBootstrapPromise;
+  if (PROTECTED_FLOW_BOOTSTRAP_PROMISE) {
+    return await PROTECTED_FLOW_BOOTSTRAP_PROMISE;
   }
 
-  protectedFlowBootstrapPromise = (async () => {
-    reqSignReady = false;
-    reqSignThumbprint = null;
+  PROTECTED_FLOW_BOOTSTRAP_PROMISE = (async () => {
+    const started = performance.now();
 
-    if (!hostJweJwk) {
+    REQ_SIGN_READY = false;
+    REQ_SIGN_THUMBPRINT = null;
+
+    if (!HOST_JWE_JWK) {
       await fetchVerifiedHostJweJwk();
     }
 
@@ -454,14 +550,60 @@ async function ensureProtectedFlowReady() {
       reused: reg.reused
     };
 
-    log('protected-flow ready hostKid=' + out.hostJweKid + ' reqSignKid=' + out.reqSignKid + ' thumb=' + out.reqSignThumbprint);
+    const totalMs = performance.now() - started;
+    await postMetric('protected_flow_bootstrap', {
+      host_jwe_kid: out.hostJweKid,
+      req_sign_kid: out.reqSignKid,
+      req_sign_thumbprint: out.reqSignThumbprint,
+      total_ms: ms3(totalMs)
+    });
+
+    log(
+      'protected-flow ready',
+      'hostKid=' + out.hostJweKid,
+      'reqSignKid=' + out.reqSignKid,
+      'thumb=' + out.reqSignThumbprint
+    );
+
     return out;
   })();
 
   try {
-    return await protectedFlowBootstrapPromise;
+    return await PROTECTED_FLOW_BOOTSTRAP_PROMISE;
   } finally {
-    protectedFlowBootstrapPromise = null;
+    PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
+  }
+}
+
+async function runHostWrongClientKeyDemo() {
+  const result = await generateReqSigningKeypair();
+
+  const thumbprint = await computeReqSignJwkThumbprint(result.jwk);
+  const proofBase = buildReqKeyRegistrationProofBase(result.kid, thumbprint);
+
+  const proofBuf = await crypto.subtle.sign(
+    { name: 'RSA-PSS', saltLength: 32 },
+    REQ_SIGN_KEYPAIR.privateKey,
+    new TextEncoder().encode(proofBase)
+  );
+
+  const badThumbprint = bytesToB64Url(crypto.getRandomValues(new Uint8Array(32)));
+
+  try {
+    await fetchVerifiedJson('POST', '/req-key/register', {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kid: result.kid,
+        jwk: result.jwk,
+        jwkThumbprint: badThumbprint,
+        proof: bytesToB64(proofBuf)
+      })
+    });
+    return { ok: false, message: 'demo unexpectedly succeeded' };
+  } catch (e) {
+    const message = e?.message || String(e);
+    await postMetric('wrong_host_key_demo', { ok: true, message });
+    return { ok: true, message };
   }
 }
 
@@ -471,66 +613,102 @@ self.addEventListener('message', async event => {
   if (type === 'GET_PROTECTED_FLOW_STATE') {
     try {
       const state = await ensureProtectedFlowReady();
-      event.source?.postMessage?.({ type: 'PROTECTED_FLOW_STATE', ...state });
+      if (event.source?.postMessage) {
+        event.source.postMessage({
+          type: 'PROTECTED_FLOW_STATE',
+          ...state
+        });
+      }
     } catch (e) {
       const msg = e?.message || String(e);
-      log('ERROR protected-flow bootstrap: ' + msg);
-      event.source?.postMessage?.({ type: 'PROTECTED_FLOW_STATE', ok: false, message: msg });
+      log('ERROR protected-flow bootstrap:', msg);
+      if (event.source?.postMessage) {
+        event.source.postMessage({
+          type: 'PROTECTED_FLOW_STATE',
+          ok: false,
+          message: msg
+        });
+      }
     }
     return;
   }
 
   if (type === 'RUN_HOST_WRONG_CLIENT_KEY_DEMO') {
     try {
-      await registerReqSigningKeyWithServer('host-wrong-client-key', true);
-      log('Host wrong client key demo unexpectedly passed');
-      event.source?.postMessage?.({
-        type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
-        ok: false,
-        message: 'Unexpected success'
-      });
+      const result = await runHostWrongClientKeyDemo();
+      if (event.source?.postMessage) {
+        event.source.postMessage({
+          type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
+          ...result
+        });
+      }
     } catch (e) {
       const msg = e?.message || String(e);
-      log('Host wrong client key demo result: ' + msg);
-      event.source?.postMessage?.({
-        type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
-        ok: true,
-        message: msg
-      });
+      if (event.source?.postMessage) {
+        event.source.postMessage({
+          type: 'HOST_WRONG_CLIENT_KEY_DEMO_DONE',
+          ok: false,
+          message: msg
+        });
+      }
     }
   }
 });
 
 async function addRequestSignature(headers, method, targetUri, bodyBytes) {
-  if (!reqSignKeypair || !reqSignKid || !reqSignReady) {
+  if (!REQ_SIGN_KEYPAIR || !REQ_SIGN_KID || !REQ_SIGN_READY) {
     throw new Error('request-signing key not ready');
   }
 
+  const digestStarted = performance.now();
   const digestHash = await crypto.subtle.digest('SHA-256', bodyBytes);
   const digestB64 = bytesToB64(digestHash);
+  const digestMs = performance.now() - digestStarted;
+
   const created = Math.floor(Date.now() / 1000);
+
+  const demo = new URL(targetUri, self.location.origin).searchParams.get('demo');
+  const sendDigestB64 = demo === 'req-bad-digest'
+    ? bytesToB64(new Uint8Array(32))
+    : digestB64;
+
+  const contentDigestHeader = 'sha-256=:' + sendDigestB64 + ':';
 
   const base =
     `"@method": "${String(method).toLowerCase()}"\n` +
     `"@target-uri": "${targetUri}"\n` +
     `"x-req-created": ${created}\n` +
-    `"x-req-content-digest": sha-256=:${digestB64}:\n` +
-    `"x-client-key-id": ${reqSignKid}`;
+    `"x-req-content-digest": ${contentDigestHeader}\n` +
+    `"x-client-key-id": ${REQ_SIGN_KID}`;
 
+  const signStarted = performance.now();
   const sigBuf = await crypto.subtle.sign(
     { name: 'RSA-PSS', saltLength: 32 },
-    reqSignKeypair.privateKey,
+    REQ_SIGN_KEYPAIR.privateKey,
     new TextEncoder().encode(base)
   );
+  const signMs = performance.now() - signStarted;
 
-  headers.set('X-Client-Key-Id', reqSignKid);
+  headers.set('X-Client-Key-Id', REQ_SIGN_KID);
   headers.set('X-Req-Created', String(created));
-  headers.set('X-Req-Content-Digest', 'sha-256=:' + digestB64 + ':');
+  headers.set('X-Req-Content-Digest', contentDigestHeader);
   headers.set('X-Req-Signature', bytesToB64(sigBuf));
-}
 
-function applyRequestDigestTamper(headers) {
-  headers.set('X-Req-Content-Digest', 'sha-256=:' + bytesToB64(new Uint8Array(32)) + ':');
+  await postMetric('request_sign', {
+    path: targetUri,
+    method,
+    req_sign_kid: REQ_SIGN_KID,
+    req_body_bytes: bodyBytes.byteLength || 0,
+    digest_ms: ms3(digestMs),
+    signature_ms: ms3(signMs),
+    total_ms: ms3(digestMs + signMs),
+    req_sign_header_bytes: approximateSelectedHeaderBytes(headers, [
+      'X-Client-Key-Id',
+      'X-Req-Created',
+      'X-Req-Content-Digest',
+      'X-Req-Signature'
+    ])
+  });
 }
 
 self.addEventListener('fetch', event => {
@@ -542,9 +720,9 @@ self.addEventListener('fetch', event => {
 
   event.respondWith((async () => {
     await ensureSigVerifyKeyReady();
-    const demo = getDemoForApi(url);
 
     if (shouldBypassSecurity(url)) {
+      const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
       const init = {
         method: event.request.method,
         redirect: 'follow',
@@ -564,10 +742,12 @@ self.addEventListener('fetch', event => {
         }
       }
 
-      const response = await fetch(APP_ORIGIN + url.pathname + url.search, init);
-      log('BYPASS ' + url.pathname + ' → ' + response.status);
-      return response;
+      const res = await fetch(upstreamUrl, init);
+      log('BYPASS', url.pathname, '→', res.status);
+      return res;
     }
+
+    const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
 
     const init = {
       method: event.request.method,
@@ -592,45 +772,76 @@ self.addEventListener('fetch', event => {
 
     if (shouldSignRequest(url, event.request.method)) {
       await ensureProtectedFlowReady();
-      await addRequestSignature(init.headers, event.request.method, url.pathname + url.search, requestBodyBytes);
-
-      if (demo === 'req-bad-digest') {
-        applyRequestDigestTamper(init.headers);
-        log('request demo active: wrong request digest');
-      }
+      const targetUri = url.pathname + url.search;
+      await addRequestSignature(init.headers, event.request.method, targetUri, requestBodyBytes);
     }
 
-    let response;
+    const reqStarted = performance.now();
+    let res;
     try {
-      response = await fetch(APP_ORIGIN + url.pathname + url.search, init);
+      res = await fetch(upstreamUrl, {
+        ...init,
+        mode: 'cors',
+        cache: 'no-store'
+      });
     } catch (e) {
-      log('NETWORK ERROR ' + url.pathname + ' ' + (e?.message || String(e)));
+      log('NETWORK ERROR', url.pathname, e?.message || String(e));
+      await postMetric('network_error', {
+        path: url.pathname + url.search,
+        method: event.request.method,
+        error: e?.message || String(e)
+      });
       throw e;
     }
+    const fetchMs = performance.now() - reqStarted;
 
-    const ct = response.headers.get('Content-Type') || '';
+    const ct = res.headers.get('Content-Type') || '';
     if (!isProtectedContentType(ct)) {
-      log('PASS (unverified type) ' + url.pathname + ' ct=' + ct + ' → ' + response.status);
-      return response;
+      log('PASS (unverified type)', url.pathname, 'ct=', ct, '→', res.status);
+      return res;
     }
 
-    const bodyBytes = await response.clone().arrayBuffer();
+    const bodyBytes = await res.clone().arrayBuffer();
 
     try {
-      await verifyResponse(response, bodyBytes, event.request.method, url.pathname + url.search);
+      const method = event.request.method;
+      const targetUri = url.pathname + url.search;
+      const verifyDiag = await verifyResponse(res, bodyBytes, method, targetUri);
 
-      const outHeaders = new Headers(response.headers);
+      log('OK', url.pathname, 'ct=', ct, 'status=', res.status);
+
+      const outHeaders = new Headers(res.headers);
       outHeaders.delete('content-length');
 
+      await postMetric('fetch_ok', {
+        path: targetUri,
+        method,
+        status: res.status,
+        fetch_ms: ms3(fetchMs),
+        verify_ms: verifyDiag.totalMs,
+        total_ms: ms3(fetchMs + (verifyDiag.totalMs || 0)),
+        resp_body_bytes: bodyBytes.byteLength || 0
+      });
+
       return new Response(bodyBytes, {
-        status: response.status,
-        statusText: response.statusText,
+        status: res.status,
+        statusText: res.statusText,
         headers: outHeaders
       });
     } catch (e) {
-      log('BLOCK ' + url.pathname + ' reason=' + (e?.message || String(e)) + ' ct=' + ct + ' status=' + response.status);
+      log('BLOCK', url.pathname, 'reason=', e.message || String(e), 'ct=', ct, 'status=', res.status);
+
+      await postMetric('fetch_blocked', {
+        path: url.pathname + url.search,
+        method: event.request.method,
+        status: res.status,
+        fetch_ms: ms3(fetchMs),
+        error: e?.message || String(e),
+        content_type: ct
+      });
+
       return new Response(
-        'Blocked by Service Worker (integrity violation): ' + (e?.message || 'unknown'),
+        'Blocked by Service Worker (integrity violation): ' + (e.message || 'unknown'),
         { status: 498, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
       );
     }
