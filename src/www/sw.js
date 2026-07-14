@@ -3,7 +3,7 @@ const TRUSTED_SIG_PUB_JWK = {
   kid: 'sig-key-1',
   use: 'sig',
   alg: 'PS256',
-  n: 'wSOfiQdpVMMEeqJv-Nz_yifuyOJb6TglNPD7wrkexmlRpe4u7QyUscTfBQbt6rNxKjIv9W9LGhy4hk7WqwHVBLFBE_uvF0-SIjxDdL2EecV7Xd4-iRnjj2aQV0NVRguE01O1ZKl-vJDxbzFBuUhjwmgxSxFvudjN-owZYdTk-qaqn0kFaGsSqfS70hUgL8WV_gkMNhWAhlOQcVgfcC4xesafCMolEO1bZ-XO1l_gcGW4k8Dr6U7vozaZTvjQUjeF_fXlHbXOWsRgOxU61qe8RSmFFXAuYTkcP_KXpSgQxC8XojR04DLQfJTobf1O0LzeS0IPNuqxgOCH-zuyLdSYsQ',
+  n: 'nzI9d5xNlXASWarIld5sMQrMtig7NqMaFtb6h-6mUyGH5kKSgorkr2BzEDcmCDTSc0labkv9JldYded516_AnVzQIC4Y_xLuK90J3H0GDLfPWu1PN3BQxkle_HYM-KzwxjEsIi2PHJFNkURqyx7WVZ1IjKTurUYpW3Y0T08XxTGwfsnA0JcBIR0fFt8mUupj59Gud0VjYt7Q_xrGxx07IsHIUDR1B_KwbIkdCM8vY4GWvzp_7I0CFV38rt-tQ3l1c2-WntoXPNqlb4TLS4ZylwVmQIs5ylRdZj0zDeEI76S_U4wZEvWn8RPmLiA2uIoxRoz4hR-la3nqGd5Y2ImJgw',
   e: 'AQAB'
 };
 

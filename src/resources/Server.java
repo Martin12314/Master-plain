@@ -548,8 +548,6 @@ public class Server {
             h.set("X-Metric-Resp-Header-Bytes", String.valueOf(headerBytes));
             h.set("X-Metric-Resp-Total-Bytes", String.valueOf(headerBytes + sendBody.length));
 
-            appendHostResponseMetric(ex, status, sendBody.length, headerBytes, signMs);
-
             if ("HEAD".equalsIgnoreCase(ex.getRequestMethod())) {
                 ex.sendResponseHeaders(status, -1);
                 ex.close();
